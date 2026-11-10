@@ -1,97 +1,118 @@
-# PSM test suite
+# PSM Test Suite
 
-This suite runs the [PSM](https://github.com/Qualcomm-MDP/PSM) pipeline on one area, then runs PSM's evaluation scripts on the result. Each run saves a report and a `summary.json`, so you can compare runs across machines, areas and PSM commits.
+A benchmarking tool for the [Photorealistic Street Maps (PSM)](https://github.com/Qualcomm-MDP/PSM) pipeline. Run PSM on a geographic area, collect performance and evaluation metrics, and compare results across machines and configurations.
 
-It **does not include PSM.** It runs an existing PSM checkout through PSM's own CLI (`src/main.py --profile`) and never modifies that checkout.
-
-## Prerequisites
-
-- **Python 3.11+** to run the suite. It uses only the standard library, so there is nothing to install.
-- **A PSM checkout with its dependencies installed.** Follow PSM's README (`poetry install`). The geometry evaluation also needs `laspy[lazrs]` in that same environment: `poetry run pip install "laspy[lazrs]"`.
-- **A Mapillary token** in `<PSM>/.env`, as `MAPILLARY_ACCESS_TOKEN=...`. PSM's `.env` is git-ignored; never put the token in this repo.
-- **Network access** for Mapillary, OSM, elevation tiles and USGS LiDAR. The first run with segmentation on also downloads about 1 GB of model weights.
+The suite runs a separate local PSM checkout; it does not include or modify PSM.
 
 ## Setup
 
-```
-git clone <this repo> psm-test-suite && cd psm-test-suite
-cp config.example.toml config.toml        # local, git-ignored
+**Requirements:**
+- Python 3.11+
+- A local [PSM](https://github.com/Qualcomm-MDP/PSM) checkout with dependencies installed (`poetry install`)
+- A Mapillary access token in `<PSM>/.env` (`MAPILLARY_ACCESS_TOKEN=...`)
+- Internet access for imagery, map data, and elevation data
+
+For geometry evaluation, install `laspy[lazrs]` in PSM's environment:
+
+```bash
+poetry run pip install "laspy[lazrs]"
 ```
 
-Edit `config.toml`:
+Clone the test suite and create your local configuration:
+
+```bash
+git clone <repo-url>
+cd psm-test-suite
+cp config.example.toml config.toml
+```
+
+Edit `config.toml` to specify your PSM checkout, test region, and pipeline options:
 
 ```toml
 [psm]
-dir = "../PSM"          # your PSM checkout (relative to config.toml, or absolute)
-python = ""             # empty = PSM's .venv or Poetry environment, found automatically
+dir = "../PSM"
 
 [region]
 name = "Ann Arbor"
-bbox = [-83.74998, 42.28025, -83.74695, 42.28250]   # west, south, east, north
+bbox = [-83.74998, 42.28025, -83.74695, 42.28250] #west south east north
 
 [pipeline]
 terrain = true
-segmentation = true     # false = --no-seg (faster, no model download)
-poses = "raw"           # raw | computed | colmap
+segmentation = true
+poses = "raw"
 ```
 
-Every option is described in `config.example.toml`. Each pipeline setting maps to a real `src/main.py` flag. Anything else goes in `extra_args`.
+See `config.example.toml` for all available settings. The PSM path can also be specified with `--psm-dir`.
 
-**How the PSM checkout is chosen.** The first match wins:
-1. `--psm-dir`
-2. `$PSM_REPO`
-3. `psm.dir` in the config file
-4. `../PSM` or `../qualcomm/PSM` next to the suite
+## Run a Test
 
-The interpreter is chosen the same way: `--python`, then `$PSM_PYTHON`, then `psm.python`, then automatic discovery.
+```bash
+# Check configuration without running PSM
+python3 run_test.py --config config.toml --dry-run
 
-## Run
-
-```
-python3 run_test.py --config config.toml --dry-run   # checks paths, token, hardware; runs nothing
+# Run the pipeline and evaluations
 python3 run_test.py --config config.toml
 ```
 
-Command-line options override the config for one run:
-- `--bbox W S E N --name "Main St"`, or `--location "Ann Arbor, Michigan" --size-km 0.5` (geocoded)
-- `--no-seg`, `--no-terrain`, `--no-evals`
-- `-- <raw main.py args>`
+You can override settings for individual runs:
 
-Run the self-checks with `python3 -m unittest discover -s tests`. They are offline and don't need PSM.
+```bash
+# Test another bounding box
+python3 run_test.py --config config.toml --bbox W S E N
+
+# Run without segmentation
+python3 run_test.py --config config.toml --no-seg
+```
+
+Additional PSM arguments can be passed after `--`.
+
+The first full run may download approximately 1 GB of model weights.
 
 ## Results
 
-Each run creates a new folder, `results/<date>_<area>_<machine>/`. Earlier runs are never overwritten. It contains:
+Each run creates a separate folder under `results/`. Previous runs are never overwritten.
 
-- **`summary.json`**, with the same fields for every run:
-  - hardware: CPU, RAM, GPUs, whether torch can use CUDA or MPS, and the device PSM would pick
-  - the exact bbox and area
-  - the PSM commit and the suite commit
-  - the resolved settings and `main.py` arguments
-  - the pipeline status
-  - the PSM profiler's per-stage wall time, CPU time and memory
-  - the evaluation scores
-- **`report.md`**: the same information, readable.
-- **`logs/`**: the pipeline and evaluation logs.
-- **`artifacts/`**: `model.glb`, `profile.json` and `mapillary.json`.
-- **`eval/`**: each evaluation's own output files.
-
-## Comparing machines
-
-Run the same `config.toml` on each machine, at the same PSM commit, with a `machine_label` set or `$PSM_MACHINE_LABEL`. Collect the `results/` folders in one place, then run:
-
+```text
+results/<run-id>/
+├── summary.json       # Structured metrics and run metadata
+├── report.md          # Human-readable results
+├── logs/              # Pipeline and evaluation logs
+├── artifacts/         # GLB model, profiler data, imagery metadata
+└── eval/              # Evaluation scores and supporting files
 ```
+
+Results include:
+- **Hardware:** CPU, GPU, RAM, and available compute backend
+- **Configuration:** geographic area, pipeline settings, and Git commits
+- **Performance:** total and per-stage runtime, CPU time, and memory
+- **Evaluation:** geometry accuracy and other available metrics
+
+## Compare Runs
+
+Run the same configuration and PSM commit on different machines, then collect their result folders in one place.
+
+```bash
 python3 compare.py results/*/summary.json --md compare.md --csv compare.csv
 ```
 
-The table lists runtimes, memory and geometry scores, and says when the bbox, PSM commit, suite commit or options differ between runs.
+The comparison includes runtime, memory, and geometry scores, and flags differences in configurations or commits.
 
 ## Evaluations
 
-| evaluation | runs when |
+| Evaluation | Availability |
 |---|---|
-| Geometry vs. LiDAR (`scripts/eval/eval_geometry_lidar.py`): building height M1, terrain M2, roof elevation M3 | Automatically after every run. Until the script is merged into PSM `main`, it is read from `origin/feat/geometry-eval` with `git show`, so `git fetch` the PSM checkout first. Needs `laspy[lazrs]` and USGS LiDAR coverage (US only; or set `evaluation.laz`) |
-| Pose alignment stats | `poses = "colmap"` (needs COLMAP) |
-| UV texture quality, texture confidence, render-vs-photo metrics | Reported as SKIPPED, with the reason: not implemented in PSM, unmerged, or they need Blender and single-building exports |
+| Geometry vs. LiDAR (building height, terrain, roof elevation) | Automatic when LiDAR data and dependencies are available |
+| Pose alignment | Requires COLMAP and `poses = "colmap"` |
+| Texture quality and image comparison | Skipped when implementations or dependencies are unavailable |
 
-A skipped or failed evaluation never fails the run. The reason is recorded in the report.
+**Geometry evaluation setup:** Until `eval_geometry_lidar.py` is merged into PSM's main branch, fetch `origin/feat/geometry-eval` in your PSM checkout. Geometry evaluation requires USGS LiDAR coverage or locally supplied LAZ data.
+
+Unavailable evaluations are marked `SKIPPED` with an explanation.
+
+## Development
+
+Run the offline tests with:
+
+```bash
+python3 -m unittest discover -s tests
+```
