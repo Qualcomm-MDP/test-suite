@@ -1,0 +1,68 @@
+"""summary.json -> report.md"""
+
+from __future__ import annotations
+
+
+def _f(v, fmt="{:.3f}"):
+    if v is None:
+        return "unavailable"
+    if isinstance(v, float):
+        return fmt.format(v)
+    return str(v)
+
+
+def markdown(s: dict) -> str:
+    m, loc, p, perf = s["machine"], s["location"], s["pipeline"], s["performance"]
+    b = loc["bbox"]
+    L = [f"# PSM test: {loc.get('name') or loc.get('query') or 'bbox'} on {m['label']}", "",
+         f"**Overall: {s['status'].upper()}**  (run `{s['run_id']}`, {s['created_utc']})", "",
+         "| | |", "|---|---|",
+         f"| Area | {b['west']}, {b['south']}, {b['east']}, {b['north']} (W S E N), "
+         f"{loc['area_km2']} km² — {loc['method']} |",
+         f"| Machine | {m['cpu']}, {m['cpu_cores']} cores, {_f(m['ram_gb'], '{:.0f}')} GB RAM, "
+         f"{m['os']} |",
+         f"| Compute | {m['compute']}; ML device PSM would pick: {m.get('expected_ml_device') or 'unknown'} |",
+         f"| PSM | `{p['git'].get('short')}` ({p['git'].get('branch')}"
+         f"{', dirty' if p['git'].get('dirty') else ''}"
+         f"{', behind origin/main by ' + str(p['git']['behind_origin_main']) if p['git'].get('behind_origin_main') else ''}) |",
+         f"| Options | `{' '.join(p['pipeline_args']) or '(PSM defaults)'}` |",
+         f"| Pipeline | {p['status']} (exit {p['exit_code']}), wall {_f(p['wall_time_s'], '{:.1f}')} s"
+         f"{', degraded: ' + ', '.join(p['degraded']) if p['degraded'] else ''} |",
+         f"| Buildings left out of mesh | {p['flagged_buildings']} |", ""]
+    if p.get("error_lines"):
+        L += ["**Errors**", "", "```", *p["error_lines"], "```", ""]
+    L += ["## Performance (PSM profiler)", ""]
+    if not perf.get("available"):
+        L += [f"Unavailable: {perf.get('reason')}", ""]
+    else:
+        L += [f"Total {_f(perf['total_wall_time_s'], '{:.2f}')} s"
+              + (f" ({perf['min_per_km2']:.1f} min/km²)" if perf.get("min_per_km2") else "")
+              + f"; largest process RSS {_f(p.get('max_process_rss_mb'), '{:.0f}')} MB (OS).", "",
+              "| stage | status | wall s | cpu s | py heap peak MB | CUDA Δ MB |", "|---|---|--:|--:|--:|--:|"]
+        for st in perf["stages"]:
+            L.append(f"| {st['name']} | {st['status']} | {_f(st['wall_time_s'], '{:.2f}')} | "
+                     f"{_f(st['cpu_time_s'], '{:.2f}')} | {_f(st['py_heap_peak_mb'], '{:.1f}')} | "
+                     f"{_f(st['cuda_alloc_delta_mb'], '{:.1f}')} |")
+        L += ["", *[f"- {n}" for n in perf.get("notes", [])], ""]
+    L += ["## Evaluations", "", "| metric | status | source | result |", "|---|---|---|---|"]
+    for e in s["evaluations"]:
+        if e["status"] == "OK":
+            key = {k: v for k, v in e["scores"].items() if v is not None and not isinstance(v, dict)}
+            txt = ", ".join(f"{k}={_f(v)}" for k, v in list(key.items())[:8])
+        else:
+            txt = e.get("reason") or ""
+        L.append(f"| {e['name']} | {e['status']} | `{e['source']}` | {txt} |")
+    L.append("")
+    geo = next((e for e in s["evaluations"] if e["name"] == "geometry_vs_lidar" and e["status"] == "OK"), None)
+    if geo:
+        g = geo["scores"]
+        L += ["### Geometry vs. LiDAR (all evaluated buildings, metres, model − LiDAR)", "",
+              "| metric | n | median | RMSE | MAE |", "|---|--:|--:|--:|--:|"]
+        for k in ("M1_height_err", "M2_terrain_err", "M2_base_err", "M3_roof_err"):
+            L.append(f"| {k} | {_f(g.get(k + '_n'))} | {_f(g.get(k + '_median'))} | "
+                     f"{_f(g.get(k + '_rmse'))} | {_f(g.get(k + '_mae'))} |")
+        L += ["", f"Building status: {g.get('building_status_counts')}", ""]
+    for e in s["evaluations"]:
+        if e["status"] == "OK" and e.get("interpretation"):
+            L += [f"- **{e['name']}** ({e['units']}): {e['interpretation']}"]
+    return "\n".join(L) + "\n"

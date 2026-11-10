@@ -1,0 +1,28 @@
+# local settings and credentials
+config.toml
+.env
+.env.*
+*.pem
+*.key
+
+# local tools and Python environments
+.tools/
+.venv*/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# run outputs, caches and large generated files
+results/*
+!results/.gitkeep
+cache/
+*.glb
+*.laz
+*.las
+*.npz
+*.png
+*.jpg
+*.pth
+*.safetensors

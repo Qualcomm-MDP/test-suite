@@ -1,0 +1,43 @@
+# PSM test suite settings. Copy to config.toml (git-ignored) and edit:
+#   cp config.example.toml config.toml
+# Relative paths are relative to this file. Command-line options override everything here.
+# No credentials here: the Mapillary token goes in <PSM checkout>/.env (MAPILLARY_ACCESS_TOKEN=...).
+
+[psm]
+# PSM checkout (must contain src/main.py). Empty: $PSM_REPO, else ../PSM or ../qualcomm/PSM.
+dir = ""
+# PSM's Python interpreter. Empty: $PSM_PYTHON, else <PSM>/.venv, else `poetry env info -e`.
+python = ""
+
+[region]
+name = "Ann Arbor"
+bbox = [-83.74998, 42.28025, -83.74695, 42.28250]   # west, south, east, north (degrees)
+# Instead of bbox (set only one), a geocoded place or a centre point plus a square size:
+# location = "Ann Arbor, Michigan"     # needs network (OSM Nominatim)
+# center = [42.2814, -83.7485]         # lat, lon
+# size_km = 0.5                         # side of the square around location/center
+max_area_km2 = 2.0                      # refuse bigger areas (runtime grows with area)
+
+[pipeline]
+# Each setting maps to a src/main.py option.
+terrain = true              # --terrain
+segmentation = true         # false -> --no-seg (no Mask2Former/LaMa; ~900 MB download on first run if true)
+fill_obstructions = true    # false -> --no-fill (segment, but don't inpaint)
+naip = false                # --naip (aerial imagery for ground/roofs; turns on terrain)
+texture = "blend"           # --texture blend|best
+poses = "raw"               # --poses raw|computed|colmap (colmap needs COLMAP 4.2+)
+aligned_only = false        # --aligned-only (colmap only)
+alignment_dir = ""          # --alignment-dir DIR (colmap only)
+# min_quality = 0.6         # --min-quality SCORE (0-1), off when unset
+extra_args = []             # any other src/main.py arguments, e.g. ["--texture", "best"]
+
+[test]
+results_dir = "results"
+machine_label = ""          # empty: $PSM_MACHINE_LABEL, else the hostname
+run_evaluations = true
+
+[evaluation]
+# Where to read scripts/eval/eval_geometry_lidar.py if the checkout doesn't have it yet.
+geometry_ref = "origin/feat/geometry-eval"
+laz = []                    # local LiDAR tiles instead of downloading USGS 3DEP
+timeout_s = 3600

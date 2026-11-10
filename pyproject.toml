@@ -1,0 +1,9 @@
+[project]
+name = "psm-test-suite"
+version = "2.0.0"
+description = "Runs the PSM pipeline on an area, collects its profiler output and evaluation scores"
+requires-python = ">=3.11"   # tomllib
+# The harness uses only the standard library. PSM's own dependencies live in the PSM checkout
+# (installed there with `poetry install`); the geometry evaluation also needs laspy[lazrs] in
+# that environment.
+dependencies = []
