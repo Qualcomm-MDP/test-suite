@@ -1,0 +1,181 @@
+{
+  "pipeline": "photorealistic-street-maps",
+  "started_at": "2026-11-10T01:02:15.574125+00:00",
+  "finished_at": "2026-11-10T01:14:01.715474+00:00",
+  "total_wall_time_s": 706.14,
+  "system": {
+    "python": "3.13.0",
+    "os": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "cpu_name": "arm",
+    "cpu_count": 12,
+    "gpu": {
+      "available": false,
+      "name": "N/A",
+      "total_vram_mb": "N/A",
+      "count": 0
+    }
+  },
+  "stages": [
+    {
+      "name": "fetch",
+      "wall_time_s": 151.3621,
+      "cpu_time_s": 2.2033,
+      "peak_memory_mb": 9.3419,
+      "start_memory_mb": 0.0,
+      "end_memory_mb": 3.4112,
+      "memory_delta_mb": 3.4112,
+      "gpu_start": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_end": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_delta_allocated_mb": "N/A",
+      "throughput": {},
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "align_poses",
+      "wall_time_s": 0.0011,
+      "cpu_time_s": 0.0011,
+      "peak_memory_mb": 0.1125,
+      "start_memory_mb": 0.0,
+      "end_memory_mb": 0.1079,
+      "memory_delta_mb": 0.1079,
+      "gpu_start": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_end": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_delta_allocated_mb": "N/A",
+      "throughput": {},
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "terrain",
+      "wall_time_s": 0.6498,
+      "cpu_time_s": 0.1113,
+      "peak_memory_mb": 5.4833,
+      "start_memory_mb": 0.0,
+      "end_memory_mb": 0.9656,
+      "memory_delta_mb": 0.9656,
+      "gpu_start": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_end": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_delta_allocated_mb": "N/A",
+      "throughput": {},
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "build_mesh",
+      "wall_time_s": 0.2499,
+      "cpu_time_s": 0.2424,
+      "peak_memory_mb": 0.7919,
+      "start_memory_mb": 0.0,
+      "end_memory_mb": 0.5278,
+      "memory_delta_mb": 0.5278,
+      "gpu_start": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_end": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_delta_allocated_mb": "N/A",
+      "throughput": {},
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "naip",
+      "wall_time_s": 0.0,
+      "cpu_time_s": 0.0,
+      "peak_memory_mb": 0.0019,
+      "start_memory_mb": 0.0,
+      "end_memory_mb": 0.0001,
+      "memory_delta_mb": 0.0001,
+      "gpu_start": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_end": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_delta_allocated_mb": "N/A",
+      "throughput": {},
+      "status": "skipped",
+      "error": null
+    },
+    {
+      "name": "texturing",
+      "wall_time_s": 553.2549,
+      "cpu_time_s": 320.0158,
+      "peak_memory_mb": 356.5479,
+      "start_memory_mb": 0.0,
+      "end_memory_mb": 5.4696,
+      "memory_delta_mb": 5.4696,
+      "gpu_start": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_end": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_delta_allocated_mb": "N/A",
+      "throughput": {},
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "export",
+      "wall_time_s": 0.4641,
+      "cpu_time_s": 0.4125,
+      "peak_memory_mb": 78.5239,
+      "start_memory_mb": 0.0,
+      "end_memory_mb": 3.8712,
+      "memory_delta_mb": 3.8712,
+      "gpu_start": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_end": {
+        "allocated_mb": "N/A",
+        "reserved_mb": "N/A",
+        "free_mb": "N/A"
+      },
+      "gpu_delta_allocated_mb": "N/A",
+      "throughput": {},
+      "status": "ok",
+      "error": null
+    }
+  ]
+}
