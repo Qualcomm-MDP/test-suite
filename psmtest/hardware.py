@@ -16,7 +16,7 @@ from pathlib import Path
 
 def _run(cmd: list[str], timeout: float = 15) -> str | None:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         return r.stdout.strip() if r.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
@@ -29,7 +29,7 @@ def cpu_model() -> str:
             return name
     if sys.platform.startswith("linux"):
         try:
-            for line in Path("/proc/cpuinfo").read_text().splitlines():
+            for line in Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace").splitlines():
                 if line.lower().startswith(("model name", "hardware")):
                     return line.split(":", 1)[1].strip()
         except OSError:
@@ -42,7 +42,7 @@ def ram_gb() -> float | None:
         if sys.platform == "darwin":
             return round(int(_run(["sysctl", "-n", "hw.memsize"])) / 2**30, 1)
         if sys.platform.startswith("linux"):
-            for line in Path("/proc/meminfo").read_text().splitlines():
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace").splitlines():
                 if line.startswith("MemTotal:"):
                     return round(int(line.split()[1]) / 2**20, 1)
         if sys.platform == "win32":
@@ -80,11 +80,12 @@ def is_laptop() -> bool | None:
 
 
 PROBE = r"""
-import json, sys
-out = {}
+import json, platform, sys
+out = {"python": platform.python_version(), "python_implementation": platform.python_implementation()}
 try:
     import torch
     out["torch"] = torch.__version__
+    out["torch_cuda_build"] = torch.version.cuda  # None for CPU/MPS builds
     out["cuda_available"] = torch.cuda.is_available()
     out["cuda_devices"] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
     mps = getattr(torch.backends, "mps", None)
@@ -105,8 +106,9 @@ def probe_pipeline_python(python: str | None, repo: Path) -> dict:
     if not python:
         return {"error": "no pipeline interpreter"}
     try:
-        r = subprocess.run([python, "-c", PROBE, str(repo / "src")], capture_output=True, text=True,
-                           timeout=180, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        r = subprocess.run([python, "-c", PROBE, str(repo / "src")], capture_output=True, encoding="utf-8", errors="replace",
+                           timeout=180, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                                             "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
     except (OSError, subprocess.SubprocessError) as e:
         return {"error": str(e)}
     for line in r.stdout.splitlines():
@@ -140,5 +142,11 @@ def collect(python: str | None, repo: Path, probe: bool = True) -> dict:
         "gpus": gpus,
         "compute": label,
         "torch": torch,
+        # Versions of PSM's interpreter (the one that runs the pipeline), not the suite's
+        "pipeline_python": torch.get("python"),
+        "torch_version": torch.get("torch"),
+        "torch_cuda_build": torch.get("torch_cuda_build"),
+        "suite_python": platform.python_version(),
+        # What select_device() would pick; what was actually used is pipeline.ml_devices
         "expected_ml_device": torch.get("segmentation_device"),
     }

@@ -36,7 +36,7 @@ def load(path: str | Path | None) -> tuple[dict, Path]:
         path = Path(path).expanduser().resolve()
         if not path.exists():
             raise ValueError(f"config file not found: {path}")
-        data = tomllib.loads(path.read_text())
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
         base = path.parent
         for section, values in data.items():
             if section not in cfg:

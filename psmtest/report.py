@@ -11,6 +11,25 @@ def _f(v, fmt="{:.3f}"):
     return str(v)
 
 
+def _devices(d: dict | None) -> str:
+    if not d:
+        return "not recorded (older summary)"
+    if d.get("status") != "confirmed":
+        return f"not observed — {d.get('note') or d.get('status')}"
+    parts = []
+    for comp, o in d["observed"].items():
+        fb = f" (fell back from {o['fell_back_from']})" if o.get("fell_back_from") else ""
+        parts.append(f"{comp}: {o['device']}{fb}")
+    return "confirmed from PSM's log — " + ", ".join(parts)
+
+
+def _downloads(d: dict | None) -> str:
+    if not d:
+        return "not recorded (older summary)"
+    what = ", ".join((d.get("new_cache_models") or []) + (d.get("log_evidence") or [])[:3])
+    return f"{d['status']}{' (' + what + ')' if what else ''} — {d.get('note')}"
+
+
 def markdown(s: dict) -> str:
     m, loc, p, perf = s["machine"], s["location"], s["pipeline"], s["performance"]
     b = loc["bbox"]
@@ -22,6 +41,11 @@ def markdown(s: dict) -> str:
          f"| Machine | {m['cpu']}, {m['cpu_cores']} cores, {_f(m['ram_gb'], '{:.0f}')} GB RAM, "
          f"{m['os']} |",
          f"| Compute | {m['compute']}; ML device PSM would pick: {m.get('expected_ml_device') or 'unknown'} |",
+         f"| ML device used | {_devices(p.get('ml_devices'))} |",
+         f"| Model weights | {_downloads(p.get('model_downloads'))} |",
+         f"| Software | PSM Python {m.get('pipeline_python') or 'unrecorded'}, torch "
+         f"{m.get('torch_version') or (m.get('torch') or {}).get('torch') or 'unrecorded'}"
+         f"{', CUDA build ' + m['torch_cuda_build'] if m.get('torch_cuda_build') else ''} |",
          f"| PSM | `{p['git'].get('short')}` ({p['git'].get('branch')}"
          f"{', dirty' if p['git'].get('dirty') else ''}"
          f"{', behind origin/main by ' + str(p['git']['behind_origin_main']) if p['git'].get('behind_origin_main') else ''}) |",
@@ -57,10 +81,11 @@ def markdown(s: dict) -> str:
     if geo:
         g = geo["scores"]
         L += ["### Geometry vs. LiDAR (all evaluated buildings, metres, model − LiDAR)", "",
-              "| metric | n | median | RMSE | MAE |", "|---|--:|--:|--:|--:|"]
+              "| metric | n | bias | median | RMSE | MAE | NMAD | ≤1 m | ≤3 m |",
+              "|---|--:|--:|--:|--:|--:|--:|--:|--:|"]
         for k in ("M1_height_err", "M2_terrain_err", "M2_base_err", "M3_roof_err"):
-            L.append(f"| {k} | {_f(g.get(k + '_n'))} | {_f(g.get(k + '_median'))} | "
-                     f"{_f(g.get(k + '_rmse'))} | {_f(g.get(k + '_mae'))} |")
+            L.append("| " + " | ".join([k] + [_f(g.get(f"{k}_{st}")) for st in
+                     ("n", "bias_mean", "median", "rmse", "mae", "nmad", "within_1m", "within_3m")]) + " |")
         L += ["", f"Building status: {g.get('building_status_counts')}", ""]
     for e in s["evaluations"]:
         if e["status"] == "OK" and e.get("interpretation"):

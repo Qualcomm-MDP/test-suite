@@ -5,14 +5,18 @@ SKIPPED with the reason. To add a newly merged PSM evaluation, write one functio
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
-from .pipeline import git
+from .pipeline import git, utf8_env
 
 GEOMETRY_PATH = "scripts/eval/eval_geometry_lidar.py"
 GEOMETRY_METRICS = ["M1_height_err", "M2_terrain_err", "M2_base_err", "M3_roof_err"]
+# Per-metric statistics copied into summary.json (the full set, with CIs and the per-confidence
+# and per-slope groups, stays in eval/geometry/summary.json). within_* are shares 0-1.
+GEOMETRY_STATS = ("n", "median", "rmse", "mae", "bias_mean", "nmad", "within_1m", "within_3m")
 GEOMETRY_DEPS = ["numpy", "scipy", "shapely", "pyproj", "requests", "matplotlib", "laspy", "lazrs"]
 
 
@@ -28,7 +32,8 @@ def missing_modules(python: str, modules: list[str]) -> list[str]:
     code = ("import importlib.util as u, sys\n"
             "print(' '.join(m for m in sys.argv[1:] if u.find_spec(m) is None))")
     try:
-        r = subprocess.run([python, "-c", code, *modules], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([python, "-c", code, *modules], capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+                           env=utf8_env(dict(os.environ)))
         return r.stdout.split() if r.returncode == 0 else modules
     except (OSError, subprocess.SubprocessError):
         return modules
@@ -44,16 +49,16 @@ def locate_script(repo: Path, rel: str, ref: str, dest: Path) -> tuple[Path | No
     if not text:
         return None, f"{rel} is not in the checkout or in {ref}"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text + "\n")
+    dest.write_text(text + "\n", encoding="utf-8")
     return dest, f"{rel} from {ref} @ {sha[:7]} (unmerged; read with git show)"
 
 
 def _run(cmd: list[str], cwd: Path, env: dict, log: Path, timeout: float) -> int:
-    with open(log, "w") as f:
+    with open(log, "w", encoding="utf-8") as f:
         f.write("$ " + " ".join(cmd) + "\n")
         f.flush()
         try:
-            return subprocess.run(cmd, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT,
+            return subprocess.run(cmd, cwd=cwd, env=utf8_env(env), stdout=f, stderr=subprocess.STDOUT,
                                   timeout=timeout).returncode
         except subprocess.TimeoutExpired:
             f.write(f"\nTIMEOUT after {timeout:.0f} s\n")
@@ -61,7 +66,7 @@ def _run(cmd: list[str], cwd: Path, env: dict, log: Path, timeout: float) -> int
 
 
 def _tail(path: Path, n: int = 8) -> str:
-    lines = [l for l in path.read_text(errors="replace").splitlines() if l.strip()]
+    lines = [l for l in path.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
     return " | ".join(lines[-n:])
 
 
@@ -96,9 +101,10 @@ def geometry_lidar(ctx: dict) -> dict:
     if rc != 0 or not summ.exists():
         return result(name, "FAILED", source, log=str(log),
                       reason=f"exit {rc}: {_tail(log)}")
-    return result(name, "OK", source, scores=geometry_scores(json.loads(summ.read_text())),
+    return result(name, "OK", source, scores=geometry_scores(json.loads(summ.read_text(encoding="utf-8"))),
                   units="metres (errors); fraction 0-1 (shares)", interpretation=meaning,
-                  artifacts=[str(out / f) for f in ("summary.md", "summary.json", "per_building.csv")],
+                  artifacts=[str(out / f) for f in ("summary.md", "summary.json", "per_building.csv",
+                                                     "per_building_errors.geojson") if (out / f).exists()],
                   log=str(log))
 
 
@@ -112,9 +118,10 @@ def geometry_scores(s: dict) -> dict:
     allg = s.get("groups", {}).get("all", {})
     for m in GEOMETRY_METRICS:
         d = allg.get(m, {})
-        for k in ("n", "median", "rmse", "mae"):
+        for k in GEOMETRY_STATS:
             scores[f"{m}_{k}"] = d.get(k)
     return scores
+
 
 
 def alignment_stats(ctx: dict) -> dict:
@@ -135,7 +142,7 @@ def alignment_stats(ctx: dict) -> dict:
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, dest / rel)
         arts.append(str(dest / rel))
-        data = json.loads(f.read_text())
+        data = json.loads(f.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             scores.update({f"{rel.parent}/{k}".lstrip("./"): v for k, v in data.items()
                            if isinstance(v, (int, float))})

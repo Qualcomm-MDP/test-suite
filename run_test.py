@@ -22,6 +22,33 @@ from pathlib import Path
 from psmtest import config, evals, hardware, location, pipeline, report
 
 HERE = Path(__file__).resolve().parent
+# psm-test/1: first runs (absolute artifact paths; run 1 also lacks "suite").
+# psm-test/2: paths relative to the run folder, "files" index, pipeline.ml_devices,
+#             pipeline.model_downloads, machine.pipeline_python/torch_version/torch_cuda_build,
+#             geometry bias/nmad/within_*, stages[].cuda_start/cuda_end. Only additions otherwise.
+SCHEMA = "psm-test/2"
+
+
+def rel(path, run_dir: Path):
+    """A path inside the run folder as a relative, '/'-separated string; anything else unchanged."""
+    if path is None:
+        return None
+    try:
+        return Path(path).resolve().relative_to(run_dir.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def file_index(run_dir: Path) -> dict:
+    """The run's main files, relative to the run folder; only the ones that exist."""
+    wanted = {"summary": "summary.json", "report": "report.md", "pipeline_log": "logs/pipeline.log",
+              "profile": "artifacts/profile.json", "glb": "artifacts/model.glb",
+              "overlays": "artifacts/model.overlays.json", "mapillary": "artifacts/mapillary.json",
+              "geometry_summary": "eval/geometry/summary.json",
+              "geometry_per_building": "eval/geometry/per_building.csv",
+              "geometry_per_building_geojson": "eval/geometry/per_building_errors.geojson",
+              "geometry_log": "logs/eval_geometry.log"}
+    return {k: v for k, v in wanted.items() if k in ("summary", "report") or (run_dir / v).exists()}
 
 
 def parse_args(argv=None):
@@ -132,7 +159,7 @@ def main(argv=None) -> int:
     logs, art = run_dir / "logs", run_dir / "artifacts"
     logs.mkdir()
     art.mkdir()
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PSM_ENV_DIR": str(repo)}
+    env = pipeline.utf8_env({**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PSM_ENV_DIR": str(repo)})
 
     before = pipeline.repo_snapshot(repo)
     started = time.time()
@@ -140,13 +167,21 @@ def main(argv=None) -> int:
         cmd, res = None, {"exit_code": None, "wall_time_s": None, "max_process_rss_mb": None}
         glb, perf = glb_given, {"available": False, "reason": "--glb: pipeline not run"}
         scan = {"degraded": [], "flagged_buildings": None, "error_lines": []}
+        devices = {"expected": machine["expected_ml_device"], "observed": {}, "used": [],
+                   "status": "not_run", "note": "--glb: pipeline not run"}
+        downloads = {"status": "not_run", "note": "--glb: pipeline not run"}
         status = "not_run"
     else:
         cmd = pipeline.command(py, repo, loc["bbox"], art, args)
+        cache_before = pipeline.cache_snapshot(env)
         res = pipeline.run(cmd, run_dir, env, logs / "pipeline.log")
+        cache_after = pipeline.cache_snapshot(env)
         glb = art / "model.glb"
         perf = pipeline.parse_profile(art / "profile.json")
-        scan = pipeline.scan_log((logs / "pipeline.log").read_text(errors="replace"))
+        log_text = (logs / "pipeline.log").read_text(encoding="utf-8", errors="replace")
+        scan = pipeline.scan_log(log_text)
+        devices = pipeline.ml_devices(log_text, machine["expected_ml_device"])
+        downloads = pipeline.model_downloads(log_text, cache_before, cache_after)
         status = pipeline.classify(res["exit_code"], glb.exists(), perf, scan["degraded"])
         if perf.get("total_wall_time_s") and loc["area_km2"]:
             perf["min_per_km2"] = round(perf["total_wall_time_s"] / 60 / loc["area_km2"], 2)
@@ -163,20 +198,25 @@ def main(argv=None) -> int:
         results = [evals.result(f.__name__, "SKIPPED", "-", reason="no model: the pipeline did not produce a .glb")
                    for f in evals.EVALUATIONS]
     after = pipeline.repo_snapshot(repo)
+    for e in results:  # relative to the run folder, so collected result folders stay readable
+        e["artifacts"] = [rel(x, run_dir) for x in e.get("artifacts", [])]
+        e["log"] = rel(e.get("log"), run_dir)
 
     summary = {
-        "schema": "psm-test/1", "run_id": run_dir.name, "created_utc": now.isoformat(timespec="seconds"),
+        "schema": SCHEMA, "run_id": run_dir.name, "created_utc": now.isoformat(timespec="seconds"),
         "status": status, "machine": machine, "location": loc,
         "suite": {**suite_git(), "config_file": a.config, "settings": cfg},
         "pipeline": {"git": gitinfo, "psm_dir": str(repo), "python": py, "command": cmd,
                      "pipeline_args": args, "status": status, **res,
                      **{k: scan[k] for k in ("degraded", "flagged_buildings", "error_lines")},
-                     "glb": str(glb) if glb.exists() else None,
+                     "ml_devices": devices, "model_downloads": downloads,
+                     "glb": rel(glb, run_dir) if glb.exists() else None,
                      "repo_changes": sorted(after - before) if before is not None and after is not None else None},
         "performance": perf, "evaluations": results,
+        "files": file_index(run_dir),  # relative to this summary's folder
     }
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
-    (run_dir / "report.md").write_text(report.markdown(summary))
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    (run_dir / "report.md").write_text(report.markdown(summary), encoding="utf-8")
     print(f"\n{status.upper()}  ->  {run_dir}/report.md")
     for e in results:
         print(f"  {e['status']:8} {e['name']}")
