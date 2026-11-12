@@ -114,12 +114,19 @@ def resolve_psm(cli: str | None, cfg: dict, base: Path) -> tuple[Path, str]:
                      f"Looked in: {', '.join(tried)}")
 
 
+def _interpreter(value: str, base: Path) -> Path:
+    """Like _path, but symlinks are NOT followed: a virtualenv's bin/python is a symlink to the
+    base interpreter, and only the symlink's own path activates the environment's packages."""
+    q = Path(os.path.expandvars(value)).expanduser()
+    return Path(os.path.abspath(q if q.is_absolute() else base / q))
+
+
 def resolve_python(cli: str | None, cfg: dict, base: Path, repo: Path) -> tuple[str | None, str]:
     """--python > $PSM_PYTHON > psm.python > <repo>/.venv or Poetry's environment."""
     for source, value, rel in (("--python", cli, Path.cwd()), ("PSM_PYTHON", os.environ.get("PSM_PYTHON"), Path.cwd()),
                                ("config psm.python", cfg["psm"]["python"], base)):
         if value:
-            py = _path(value, rel)
+            py = _interpreter(value, rel)
             if not py.exists():
                 raise ValueError(f"{source} = {py} does not exist")
             return str(py), source

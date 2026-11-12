@@ -495,6 +495,26 @@ class Config(unittest.TestCase):
             with self.assertRaises(ValueError):  # not a PSM checkout
                 config.resolve_psm(str(self.t / "c"), cfg, base)
 
+    def test_venv_python_symlink_kept(self):
+        """A virtualenv's bin/python is a symlink to the base Python; following it would run
+        PSM without its packages (seen on Great Lakes: /sw/pkgs/arc/python/3.12.1/bin/python3.12)."""
+        base_py = self.t / "base" / "bin" / "python3.12"
+        base_py.parent.mkdir(parents=True)
+        base_py.write_text("", encoding="utf-8")
+        venv_py = self.t / "venv" / "bin" / "python"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.symlink_to(base_py)
+        cfg, base = config.load(self.cfg_file)
+        cfg["psm"]["python"] = "../venv/bin/python"  # relative to the config file
+        venv_end = os.path.join("venv", "bin", "python")
+        with mock.patch.dict(os.environ, {"PSM_PYTHON": ""}):
+            got, src = config.resolve_python(None, cfg, base, self.t)
+            self.assertTrue(got.endswith(venv_end), got)  # not .../base/bin/python3.12
+            self.assertEqual(src, "config psm.python")
+            self.assertEqual(config.resolve_python(str(venv_py), cfg, base, self.t), (str(venv_py), "--python"))
+        with mock.patch.dict(os.environ, {"PSM_PYTHON": str(venv_py)}):
+            self.assertEqual(config.resolve_python(None, cfg, base, self.t), (str(venv_py), "PSM_PYTHON"))
+
     def test_cli_overrides_config(self):
         a = run_test.parse_args(["--config", str(self.cfg_file), "--bbox", "1", "2", "3", "4",
                                  "--no-terrain", "--", "--naip"])
