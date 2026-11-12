@@ -47,7 +47,9 @@ def file_index(run_dir: Path) -> dict:
               "geometry_summary": "eval/geometry/summary.json",
               "geometry_per_building": "eval/geometry/per_building.csv",
               "geometry_per_building_geojson": "eval/geometry/per_building_errors.geojson",
-              "geometry_log": "logs/eval_geometry.log"}
+              "geometry_log": "logs/eval_geometry.log",
+              "texture_summary": "artifacts/texture_eval/summary.json",
+              "texture_per_group": "artifacts/texture_eval/per_group.csv"}
     return {k: v for k, v in wanted.items() if k in ("summary", "report") or (run_dir / v).exists()}
 
 
@@ -68,6 +70,8 @@ def parse_args(argv=None):
     ap.add_argument("--no-terrain", action="store_true")
     ap.add_argument("--no-seg", action="store_true")
     ap.add_argument("--no-evals", action="store_true", help="skip evaluations")
+    ap.add_argument("--no-texture-eval", action="store_true",
+                    help="don't pass --evaluate-texture to PSM (no UV texture score)")
     ap.add_argument("--glb", help="evaluate this existing .glb instead of running the pipeline")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and checks; run nothing")
     ap.add_argument("pipeline_args", nargs=argparse.REMAINDER, help="after --: extra src/main.py options")
@@ -94,6 +98,8 @@ def settings(a) -> tuple[dict, Path]:
     p["extra_args"] = list(p["extra_args"]) + a.pipeline_args
     if a.no_evals:
         t["run_evaluations"] = False
+    if a.no_evals or a.no_texture_eval:
+        p["evaluate_texture"] = False
     config.validate(cfg)
     return cfg, base
 
@@ -102,6 +108,19 @@ def suite_git() -> dict:
     head = pipeline.git(HERE, "rev-parse", "HEAD")
     return {"commit": head, "dirty": bool(pipeline.git(HERE, "status", "--porcelain", "--untracked-files=no"))
             if head else None}
+
+
+def texture_eval_plan(args: list[str], repo: Path) -> dict:
+    """Whether PSM will score the texture in this run, and why not. The flag is dropped for PSM
+    checkouts whose src/main.py predates it (they would exit on the unknown option)."""
+    if "--evaluate-texture" not in args:
+        return {"requested": False, "dropped": False,
+                "reason": "turned off (pipeline.evaluate_texture = false, --no-texture-eval or --no-evals)"}
+    if not pipeline.main_supports(repo, "--evaluate-texture"):
+        return {"requested": False, "dropped": True,
+                "reason": "this PSM checkout's src/main.py has no --evaluate-texture "
+                          "(added in PSM 9f5dbb6, PR #56); update PSM to score the texture"}
+    return {"requested": True, "dropped": False, "reason": None}
 
 
 def new_run_dir(results: Path, stem: str) -> Path:
@@ -131,6 +150,9 @@ def main(argv=None) -> int:
         return 2
     loc["name"] = r["name"] or loc["query"]
     args = config.pipeline_args(p)
+    texture_eval = texture_eval_plan(args, repo)
+    if texture_eval["dropped"]:
+        args = [x for x in args if x != "--evaluate-texture"]
     results_dir = Path(a.results).resolve() if a.results else config._path(t["results_dir"], base)
     label = a.machine_label or os.environ.get("PSM_MACHINE_LABEL") or t["machine_label"] or None
     if label:
@@ -140,7 +162,8 @@ def main(argv=None) -> int:
     glb_given = Path(a.glb).resolve() if a.glb else None
     checks = {"psm_dir": f"{repo} ({repo_src})", "pipeline_python": f"{py} ({py_src})",
               "mapillary_token": pipeline.has_token(repo) if not glb_given else "not needed",
-              "evaluations": t["run_evaluations"]}
+              "evaluations": t["run_evaluations"],
+              "texture_evaluation": "on" if texture_eval["requested"] else texture_eval["reason"]}
     print(json.dumps({"config": a.config, "location": loc, "psm": gitinfo, "checks": checks,
                       "compute": machine["compute"], "expected_ml_device": machine["expected_ml_device"],
                       "pipeline_args": args, "results_dir": str(results_dir)}, indent=1))
@@ -188,15 +211,16 @@ def main(argv=None) -> int:
 
     ctx = {"repo": repo, "python": py, "run_dir": run_dir, "logs": logs, "glb": glb, "env": env,
            "bbox": loc["bbox"], "pipeline_args": args, "started": started, "laz": ev["laz"],
-           "geometry_ref": ev["geometry_ref"], "cache_dir": HERE / "cache", "eval_timeout": ev["timeout_s"]}
+           "geometry_ref": ev["geometry_ref"], "cache_dir": HERE / "cache", "eval_timeout": ev["timeout_s"],
+           "texture_eval": texture_eval if not glb_given else
+           {"requested": False, "reason": "--glb: PSM's texture evaluation runs inside a pipeline run "
+            "(it needs the reference photos the run saves)"}}
     if not t["run_evaluations"]:
-        results = [evals.result(f.__name__, "SKIPPED", "-", reason="evaluations turned off")
-                   for f in evals.EVALUATIONS]
+        results = evals.skip_all("evaluations turned off")
     elif glb.exists():
         results = evals.run_all(ctx)
     else:
-        results = [evals.result(f.__name__, "SKIPPED", "-", reason="no model: the pipeline did not produce a .glb")
-                   for f in evals.EVALUATIONS]
+        results = evals.skip_all("no model: the pipeline did not produce a .glb")
     after = pipeline.repo_snapshot(repo)
     for e in results:  # relative to the run folder, so collected result folders stay readable
         e["artifacts"] = [rel(x, run_dir) for x in e.get("artifacts", [])]

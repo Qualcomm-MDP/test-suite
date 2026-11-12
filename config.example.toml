@@ -29,6 +29,9 @@ poses = "raw"               # --poses raw|computed|colmap (colmap needs COLMAP 4
 aligned_only = false        # --aligned-only (colmap only)
 alignment_dir = ""          # --alignment-dir DIR (colmap only)
 # min_quality = 0.6         # --min-quality SCORE (0-1), off when unset
+evaluate_texture = true     # --evaluate-texture: PSM scores the UV texture (O, D, FID) as its own
+                            # last stage; ~100 MB Inception-v3 on first use. Needs PSM >= 9f5dbb6
+                            # (skipped with a reason on older checkouts)
 extra_args = []             # any other src/main.py arguments, e.g. ["--texture", "best"]
 
 [test]

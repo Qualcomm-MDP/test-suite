@@ -87,6 +87,16 @@ def markdown(s: dict) -> str:
             L.append("| " + " | ".join([k] + [_f(g.get(f"{k}_{st}")) for st in
                      ("n", "bias_mean", "median", "rmse", "mae", "nmad", "within_1m", "within_3m")]) + " |")
         L += ["", f"Building status: {g.get('building_status_counts')}", ""]
+    tex = next((e for e in s["evaluations"] if e["name"] == "texture_quality_uv_fid" and e["status"] == "OK"), None)
+    if tex:
+        x = tex["scores"]
+        L += ["### Texture quality (UV mapping; 0-1, lower O/D/F and higher confidence are better)", "",
+              "| confidence | O obstruction | D distortion | F realism | FID | partial | device | seconds |",
+              "|--:|--:|--:|--:|--:|---|---|--:|",
+              "| " + " | ".join(_f(x.get(k)) for k in ("confidence", "O_obstruction", "D_distortion",
+                                                      "F_realism", "fid", "partial", "device", "seconds")) + " |", ""]
+        if x.get("partial"):
+            L += [f"Partial score: F (realism) left out — {x.get('fid_reason') or 'no reason given'}.", ""]
     for e in s["evaluations"]:
         if e["status"] == "OK" and e.get("interpretation"):
             L += [f"- **{e['name']}** ({e['units']}): {e['interpretation']}"]

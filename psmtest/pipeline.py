@@ -98,6 +98,14 @@ def _echo(line: str) -> None:
         sys.stdout.write(line.encode(enc, errors="replace").decode(enc))
 
 
+def main_supports(repo: Path, flag: str) -> bool:
+    """Whether this checkout's src/main.py defines `flag` (older PSM exits on unknown options)."""
+    try:
+        return f'"{flag}"' in (repo / "src" / "main.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
 def has_token(repo: Path) -> bool:
     if os.environ.get("MAPILLARY_ACCESS_TOKEN"):
         return True

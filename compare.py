@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 
+EVAL_STAGES = ("evaluate_geometry", "evaluate_texture")  # PSM >= 9f5dbb6 profiler stages
 UNRECORDED = "unrecorded"  # the field did not exist in that summary's schema
 
 
@@ -25,6 +26,8 @@ def row(s: dict) -> dict:
     perf, m, p, loc = s.get("performance", {}), s["machine"], s["pipeline"], s["location"]
     geo = next((e for e in s.get("evaluations", []) if e["name"] == "geometry_vs_lidar"), {})
     g = geo.get("scores", {})
+    tex = next((e for e in s.get("evaluations", []) if e["name"] == "texture_quality_uv_fid"), {})
+    tx = tex.get("scores", {})
     st = perf.get("stages", [])
     stages = {x["name"]: x.get("wall_time_s") for x in st}
     total, fetch = perf.get("total_wall_time_s"), stages.get("fetch")
@@ -46,10 +49,13 @@ def row(s: dict) -> dict:
             "options": " ".join(p["pipeline_args"]), "status": s["status"],
             "degraded": " ".join(p.get("degraded") or []) or None,
             "total_s": total,
-            # fetch is network-bound; the rest is what the machine itself does
-            "compute_s": round(total - fetch, 4) if total is not None and fetch is not None else None,
+            # fetch is network-bound and evaluate_* stages are scoring, not map making: the rest
+            # is what the machine itself does to build the model
+            "compute_s": round(total - fetch - sum(stages.get(k) or 0 for k in EVAL_STAGES), 4)
+            if total is not None and fetch is not None else None,
             "cpu_s": perf.get("total_cpu_time_s"), "min/km2": perf.get("min_per_km2"),
-            **{f"{k}_s": stages.get(k) for k in ("fetch", "terrain", "build_mesh", "texturing", "export")},
+            **{f"{k}_s": stages.get(k) for k in ("fetch", "terrain", "build_mesh", "texturing", "export",
+                                                  "evaluate_texture")},
             "max_rss_mb": p.get("max_process_rss_mb"),
             "py_heap_peak_mb": _max(x.get("py_heap_peak_mb") for x in st),
             "cuda_reserved_max_mb": _max((x.get("cuda_end") or {}).get("reserved_mb") for x in st),
@@ -57,7 +63,10 @@ def row(s: dict) -> dict:
             "M1_rmse_m": g.get("M1_height_err_rmse"), "M1_bias_m": g.get("M1_height_err_bias_mean"),
             "M2_rmse_m": g.get("M2_terrain_err_rmse"), "M2_base_rmse_m": g.get("M2_base_err_rmse"),
             "M3_rmse_m": g.get("M3_roof_err_rmse"), "height_within_3m": g.get("height_share_within_tol"),
-            "terrain_QR06a": g.get("terrain_QR06a")}
+            "terrain_QR06a": g.get("terrain_QR06a"),
+            "texture": tex.get("status"), "tex_confidence": tx.get("confidence"),
+            "tex_partial": tx.get("partial"), "tex_O": tx.get("O_obstruction"),
+            "tex_D": tx.get("D_distortion"), "tex_F": tx.get("F_realism"), "tex_fid": tx.get("fid")}
 
 
 def main():

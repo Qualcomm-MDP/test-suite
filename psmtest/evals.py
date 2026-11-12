@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -171,13 +172,65 @@ def texture_confidence(ctx: dict) -> dict:
                           "alpha and emits no score file"))
 
 
+TEXTURE_NOT_RUN = re.compile(r"Texture evaluation (?P<what>not available|failed): (?P<reason>.+?)"
+                             r"(?:\. The model is kept\.)?\s*$", re.M)
+
+
 def texture_uv_fid(ctx: dict) -> dict:
-    return result("texture_quality_uv_fid", "SKIPPED", "none",
-                  reason="the UV texture-quality metric (O, D, FID) is not implemented on any PSM "
-                  "branch; LPIPS/DreamSim scripts are different metrics and are not substituted")
+    """PSM's UV texture-quality score (src/evaluation/texture_uv.py), run by PSM itself as its
+    last pipeline stage (--evaluate-texture), which also saves the reference street photos the
+    FID needs. This reads texture_eval/ next to the .glb; PSM never fails the run over it."""
+    name, source = "texture_quality_uv_fid", "src/evaluation/texture_uv.py (main.py --evaluate-texture)"
+    plan = ctx.get("texture_eval") or {"requested": False, "reason": "not requested"}
+    if not plan["requested"]:
+        return result(name, "SKIPPED", source, reason=plan["reason"])
+    out = ctx["glb"].parent / "texture_eval"
+    summ = out / "summary.json"
+    if summ.exists():
+        return result(name, "OK", source, scores=texture_scores(json.loads(summ.read_text(encoding="utf-8"))),
+                      units="0-1 (confidence and O/D/F terms); FID unitless",
+                      interpretation=("Confidence = 1 - (a*O + b*D + c*F), 1 = perfect. O obstruction: "
+                                      "share of the UV surface without photo texture; D distortion: share "
+                                      "of the surface stretched beyond s_max; F realism: 1 - exp(-FID/tau), "
+                                      "FID of texture patches vs the run's street photos. partial = F left "
+                                      "out (weights renormalised over O and D)."),
+                      artifacts=[str(out / f) for f in ("summary.md", "summary.json", "per_group.csv")
+                                 if (out / f).exists()])
+    log = ctx["logs"] / "pipeline.log"
+    text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+    m = None
+    for m in TEXTURE_NOT_RUN.finditer(text):
+        pass  # keep the last one
+    if m:
+        status = "SKIPPED" if m.group("what") == "not available" else "FAILED"
+        return result(name, status, source, reason=f"PSM: texture evaluation {m.group('what')}: "
+                      f"{m.group('reason').strip()}", log=str(log))
+    return result(name, "FAILED", source, log=str(log),
+                  reason=f"--evaluate-texture was passed but {summ.name} was not written in {out}")
+
+
+def texture_scores(s: dict) -> dict:
+    """texture_uv's summary.json -> the headline numbers (the full file stays in texture_eval/)."""
+    terms, counts = s.get("terms") or {}, s.get("counts") or {}
+    return {"confidence": s.get("confidence"), "partial": s.get("partial"),
+            "O_obstruction": terms.get("O"), "D_distortion": terms.get("D"), "F_realism": terms.get("F"),
+            "fid": s.get("fid"), "fid_reason": s.get("fid_reason"), "tau": s.get("tau"),
+            "o_texels": s.get("o_texels"), "weights_used": s.get("weights_used"),
+            "device": s.get("device"), "seconds": s.get("seconds"), "mode": s.get("mode"),
+            "faces": counts.get("faces"), "distorted_faces": counts.get("distorted"),
+            "groups": (s.get("web") or {}).get("groups")}
 
 
 EVALUATIONS = [geometry_lidar, texture_uv_fid, texture_confidence, alignment_stats, image_metrics]
+# The name each evaluation reports under, also when it is skipped or crashes, so a metric has one
+# name in every summary.json (before 2026-11-12 skipped entries used the function names).
+NAMES = {geometry_lidar: "geometry_vs_lidar", texture_uv_fid: "texture_quality_uv_fid",
+         texture_confidence: "texture_confidence", alignment_stats: "pose_alignment_stats",
+         image_metrics: "render_vs_photo_metrics"}
+
+
+def skip_all(reason: str) -> list[dict]:
+    return [result(NAMES[fn], "SKIPPED", "-", reason=reason) for fn in EVALUATIONS]
 
 
 def run_all(ctx: dict) -> list[dict]:
@@ -186,5 +239,6 @@ def run_all(ctx: dict) -> list[dict]:
         try:
             out.append(fn(ctx))
         except Exception as e:  # one broken evaluation must not stop the others
-            out.append(result(fn.__name__, "FAILED", fn.__module__, reason=f"{type(e).__name__}: {e}"))
+            out.append(result(NAMES.get(fn, fn.__name__), "FAILED", fn.__module__,
+                              reason=f"{type(e).__name__}: {e}"))
     return out

@@ -5,6 +5,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,7 @@ PROFILE = {"pipeline": "photorealistic-street-maps", "total_wall_time_s": 12.5,
                        "throughput": {}, "error": None}]}
 
 FAKE_MAIN = textwrap.dedent("""
-    import argparse, json, os, sys
+    import argparse, json, os, shutil, sys
     ap = argparse.ArgumentParser()
     ap.add_argument("--bbox", nargs=4); ap.add_argument("--output"); ap.add_argument("--profile")
     ap.add_argument("--dump-mapillary"); ap.add_argument("--terrain", action="store_true")
@@ -45,8 +46,20 @@ FAKE_MAIN = textwrap.dedent("""
         os.makedirs(d, exist_ok=True)
         open(os.path.join(d, "fake-lama.pt"), "wb").write(b"w")
     open(a.output, "wb").write(b"glTF")
+    if getattr(a, "evaluate_texture", False):  # only when the test adds the option (newer PSM)
+        mode = os.environ.get("FAKE_TEX", "ok")
+        if mode == "ok":  # PSM writes texture_eval/ next to the .glb
+            d = os.path.join(os.path.dirname(a.output), "texture_eval")
+            os.makedirs(d)
+            shutil.copy(os.environ["FAKE_TEX_SUMMARY"], os.path.join(d, "summary.json"))
+            open(os.path.join(d, "per_group.csv"), "w", encoding="utf-8").write("group")
+        elif mode == "unavailable":
+            print("Texture evaluation not available: Missing package: torchvision. The model is kept.")
+        elif mode == "failed":
+            print("Texture evaluation failed: RuntimeError: CUDA out of memory. The model is kept.")
     json.dump(PROFILE, open(a.profile, "w", encoding="utf-8"))
 """).replace("PROFILE", repr(PROFILE))
+TEXTURE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "texture_summary.json"  # real PSM output
 
 
 class Location(unittest.TestCase):
@@ -167,6 +180,22 @@ class CompareSchemas(unittest.TestCase):
         self.assertIn("weights", printed.split("differ between runs:")[1])
         self.assertIn("cold start", printed)
         self.assertIn("did not exist in that run's schema", printed)
+
+    def test_texture_columns_and_eval_stage_time(self):
+        raw = json.loads(TEXTURE_FIXTURE.read_text(encoding="utf-8"))
+        self.new["evaluations"] = [e for e in self.new["evaluations"] if e["name"] != "texture_quality_uv_fid"]
+        self.new["evaluations"].append(evals.result("texture_quality_uv_fid", "OK", "x",
+                                                    scores=evals.texture_scores(raw)))
+        stages = self.new["performance"]["stages"]
+        stages.append({"name": "evaluate_texture", "status": "ok", "wall_time_s": 30.0})
+        self.new["performance"]["total_wall_time_s"] += 30.0
+        r, old = self.compare.row(self.new), self.compare.row(self.old)
+        self.assertEqual((r["texture"], r["tex_confidence"], r["tex_partial"], r["tex_O"], r["tex_F"]),
+                         ("OK", raw["confidence"], True, raw["terms"]["O"], None))
+        self.assertEqual(r["evaluate_texture_s"], 30.0)
+        self.assertAlmostEqual(r["compute_s"], old["compute_s"], places=6)  # scoring time left out
+        self.assertEqual(r["total_s"], old["total_s"] + 30.0)
+        self.assertEqual((old["texture"], old["tex_confidence"]), ("SKIPPED", None))  # psm-test/1 example
 
     def test_report_renders_both(self):
         from psmtest import report
@@ -322,6 +351,7 @@ class Evaluations(unittest.TestCase):
         with mock.patch.object(evals, "EVALUATIONS", [boom, evals.texture_uv_fid]):
             r = evals.run_all({})
         self.assertEqual([x["status"] for x in r], ["FAILED", "SKIPPED"])
+        self.assertEqual(r[1]["name"], "texture_quality_uv_fid")
 
 
 class EndToEndFake(unittest.TestCase):
@@ -342,6 +372,60 @@ class EndToEndFake(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _with_texture_flag(self):
+        """Make the fake main.py look like PSM >= 9f5dbb6 (defines --evaluate-texture)."""
+        main = self.repo / "src" / "main.py"
+        old = 'ap.add_argument("--terrain", action="store_true")'
+        main.write_text(main.read_text(encoding="utf-8").replace(
+            old, old + '; ap.add_argument("--evaluate-texture", action="store_true")'), encoding="utf-8")
+
+    def _tex(self, s):
+        return next(e for e in s["evaluations"] if e["name"] == "texture_quality_uv_fid")
+
+    def test_texture_skipped_on_old_psm(self):
+        _, s, run = self._run()  # the plain fake has no --evaluate-texture, like PSM 767fbaa
+        self.assertNotIn("--evaluate-texture", s["pipeline"]["pipeline_args"])  # would crash old PSM
+        tex = self._tex(s)
+        self.assertEqual(tex["status"], "SKIPPED")
+        self.assertIn("9f5dbb6", tex["reason"])
+
+    def test_texture_scored(self):
+        self._with_texture_flag()
+        _, s, run = self._run({"FAKE_TEX_SUMMARY": str(TEXTURE_FIXTURE)})
+        self.assertIn("--evaluate-texture", s["pipeline"]["pipeline_args"])
+        tex = self._tex(s)
+        self.assertEqual(tex["status"], "OK")
+        raw = json.loads(TEXTURE_FIXTURE.read_text(encoding="utf-8"))
+        self.assertEqual((tex["scores"]["confidence"], tex["scores"]["partial"]), (raw["confidence"], True))
+        self.assertEqual((tex["scores"]["O_obstruction"], tex["scores"]["D_distortion"], tex["scores"]["F_realism"]),
+                         (raw["terms"]["O"], raw["terms"]["D"], None))
+        self.assertEqual(tex["scores"]["faces"], raw["counts"]["faces"])
+        self.assertEqual(tex["artifacts"], ["artifacts/texture_eval/summary.json", "artifacts/texture_eval/per_group.csv"])
+        self.assertEqual(s["files"]["texture_summary"], "artifacts/texture_eval/summary.json")
+        rep = (run / "report.md").read_text(encoding="utf-8")
+        self.assertIn("### Texture quality", rep)
+        self.assertIn("Partial score: F (realism) left out — turned off (--no-fid)", rep)
+
+    def test_texture_not_run_reported(self):
+        self._with_texture_flag()
+        for mode, status, text in (("unavailable", "SKIPPED", "not available: Missing package: torchvision"),
+                                   ("failed", "FAILED", "failed: RuntimeError: CUDA out of memory"),
+                                   ("silent", "FAILED", "summary.json was not written")):
+            for d in list(self.results.iterdir()) if self.results.exists() else []:
+                shutil.rmtree(d)  # temp results of the previous mode
+            rc, s, _ = self._run({"FAKE_TEX": mode})
+            tex = self._tex(s)
+            self.assertEqual((rc, tex["status"]), (0, status), mode)  # never fails the run
+            self.assertIn(text, tex["reason"], mode)
+            self.assertNotIn("The model is kept", tex["reason"])
+
+    def test_texture_turned_off(self):
+        self._with_texture_flag()
+        self.base.append("--no-texture-eval")
+        _, s, _ = self._run()
+        self.assertNotIn("--evaluate-texture", s["pipeline"]["pipeline_args"])
+        self.assertIn("turned off", self._tex(s)["reason"])
 
     def _run(self, extra_env=None, deps_missing=True):
         t = Path(self.tmp.name)  # model caches in the temp folder: the real caches are never read
@@ -430,6 +514,9 @@ class EndToEndFake(unittest.TestCase):
         self.assertFalse(s["performance"]["available"])
         self.assertTrue(any("No images found" in l for l in s["pipeline"]["error_lines"]))
         self.assertTrue(all(e["status"] == "SKIPPED" for e in s["evaluations"]))
+        self.assertEqual([e["name"] for e in s["evaluations"]],  # same names as in a successful run
+                         ["geometry_vs_lidar", "texture_quality_uv_fid", "texture_confidence",
+                          "pose_alignment_stats", "render_vs_photo_metrics"])
         self.assertIn("Unavailable", (run / "report.md").read_text(encoding="utf-8"))
 
 
@@ -461,25 +548,27 @@ class Config(unittest.TestCase):
 
     def test_defaults_and_args(self):
         cfg, _ = config.load(None)
-        self.assertEqual(config.pipeline_args(cfg["pipeline"]), ["--terrain"])
+        self.assertEqual(config.pipeline_args(cfg["pipeline"]), ["--terrain", "--evaluate-texture"])
         cfg, base = config.load(self.cfg_file)
         self.assertEqual(base, self.cfg_file.parent.resolve())
         self.assertEqual(config.pipeline_args(cfg["pipeline"]),
-                         ["--terrain", "--no-seg", "--min-quality", "0.6", "--texture", "best"])
+                         ["--terrain", "--no-seg", "--min-quality", "0.6", "--evaluate-texture",
+                          "--texture", "best"])
         p = dict(cfg["pipeline"], segmentation=True, fill_obstructions=False, naip=True, poses="colmap",
-                 aligned_only=True, min_quality=None, extra_args=[])
+                 aligned_only=True, min_quality=None, evaluate_texture=False, extra_args=[])
         self.assertEqual(config.pipeline_args(p),
                          ["--terrain", "--naip", "--no-fill", "--poses", "colmap", "--aligned-only"])
 
     def test_example_config_is_valid(self):
         cfg, _ = config.load(Path(__file__).resolve().parents[1] / "config.example.toml")
         self.assertEqual(cfg["region"]["bbox"], [-83.74998, 42.28025, -83.74695, 42.2825])
-        self.assertEqual(config.pipeline_args(cfg["pipeline"]), ["--terrain"])
+        self.assertEqual(config.pipeline_args(cfg["pipeline"]), ["--terrain", "--evaluate-texture"])
 
     def test_invalid(self):
         for text in ('[pipeline]\nposes = "gps"', '[pipeline]\nmin_quality = 2', '[nope]\nx = 1',
                      '[pipeline]\nbogus = 1', '[region]\nbbox = [1, 2]',
-                     '[region]\nbbox = [1,2,3,4]\nlocation = "x"', '[pipeline]\naligned_only = true'):
+                     '[region]\nbbox = [1,2,3,4]\nlocation = "x"', '[pipeline]\naligned_only = true',
+                     '[pipeline]\nevaluate_texture = "yes"'):
             self.cfg_file.write_text(text, encoding="utf-8")
             with self.assertRaises(ValueError, msg=text):
                 config.load(self.cfg_file)
@@ -522,7 +611,24 @@ class Config(unittest.TestCase):
         self.assertEqual(cfg["region"]["bbox"], [1, 2, 3, 4])
         self.assertEqual(cfg["region"]["name"], "")  # config's name belonged to its own bbox
         self.assertEqual(config.pipeline_args(cfg["pipeline"]),
-                         ["--no-seg", "--min-quality", "0.6", "--texture", "best", "--naip"])
+                         ["--no-seg", "--min-quality", "0.6", "--evaluate-texture", "--texture", "best", "--naip"])
+        for flag in ("--no-texture-eval", "--no-evals"):
+            a = run_test.parse_args(["--config", str(self.cfg_file), flag])
+            cfg, _ = run_test.settings(a)
+            self.assertNotIn("--evaluate-texture", config.pipeline_args(cfg["pipeline"]), flag)
+
+    def test_texture_eval_plan(self):
+        repo = self.t / "cfgPSM"
+        (repo / "src" / "main.py").write_text('ap.add_argument("--terrain")\n', encoding="utf-8")
+        old = run_test.texture_eval_plan(["--terrain", "--evaluate-texture"], repo)
+        self.assertEqual((old["requested"], old["dropped"]), (False, True))
+        self.assertIn("9f5dbb6", old["reason"])
+        (repo / "src" / "main.py").write_text('ap.add_argument(\n    "--evaluate-texture",\n)\n', encoding="utf-8")
+        new = run_test.texture_eval_plan(["--terrain", "--evaluate-texture"], repo)
+        self.assertEqual((new["requested"], new["dropped"], new["reason"]), (True, False, None))
+        off = run_test.texture_eval_plan(["--terrain"], repo)
+        self.assertEqual((off["requested"], off["dropped"]), (False, False))
+        self.assertIn("turned off", off["reason"])
 
     def test_run_dirs_never_reused(self):
         a = run_test.new_run_dir(self.t / "r", "x")

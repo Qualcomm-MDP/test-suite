@@ -22,7 +22,7 @@ DEFAULTS = {
     # Each key maps to a real src/main.py option (PSM 767fbaa); see pipeline_args().
     "pipeline": {"terrain": True, "segmentation": True, "fill_obstructions": True, "naip": False,
                  "texture": "blend", "poses": "raw", "aligned_only": False, "alignment_dir": "",
-                 "min_quality": None, "extra_args": []},
+                 "min_quality": None, "evaluate_texture": True, "extra_args": []},
     "test": {"results_dir": "results", "machine_label": "", "run_evaluations": True},
     "evaluation": {"geometry_ref": "origin/feat/geometry-eval", "laz": [], "timeout_s": 3600},
 }
@@ -59,6 +59,8 @@ def validate(cfg: dict) -> None:
         raise ValueError("pipeline.min_quality must be between 0 and 1")
     if (p["aligned_only"] or p["alignment_dir"]) and p["poses"] != "colmap":
         raise ValueError("pipeline.aligned_only / alignment_dir need poses = \"colmap\"")
+    if not isinstance(p["evaluate_texture"], bool):
+        raise ValueError("pipeline.evaluate_texture must be true or false")
     if not isinstance(p["extra_args"], list):
         raise ValueError("pipeline.extra_args must be a list of strings")
     if r["bbox"] and len(r["bbox"]) != 4:
@@ -88,6 +90,8 @@ def pipeline_args(p: dict) -> list[str]:
         args += ["--alignment-dir", str(p["alignment_dir"])]
     if p["min_quality"] is not None:
         args += ["--min-quality", str(p["min_quality"])]
+    if p["evaluate_texture"]:  # PSM >= 9f5dbb6; run_test drops it for older checkouts
+        args.append("--evaluate-texture")
     return args + [str(a) for a in p["extra_args"]]
 
 

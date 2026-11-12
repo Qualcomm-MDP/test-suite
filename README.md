@@ -125,10 +125,13 @@ The comparison includes runtime, memory, and geometry scores, and flags differen
 | Evaluation | Availability |
 |---|---|
 | Geometry vs. LiDAR (building height, terrain, roof elevation) | Automatic when LiDAR data and dependencies are available |
+| Texture quality (UV mapping: obstruction, distortion, realism/FID) | On by default with PSM `9f5dbb6` or newer; PSM scores it as its own last stage (`--evaluate-texture`) |
 | Pose alignment | Requires COLMAP and `poses = "colmap"` |
-| Texture quality and image comparison | Skipped when implementations or dependencies are unavailable |
+| Image comparison (rendered views vs. photos) | Not connected; marked `SKIPPED` |
 
-**Geometry evaluation setup:** Until `eval_geometry_lidar.py` is merged into PSM's main branch, fetch `origin/feat/geometry-eval` in your PSM checkout. Geometry evaluation requires USGS LiDAR coverage or locally supplied LAZ data.
+**Geometry evaluation setup:** The evaluator is part of PSM's main branch; older PSM checkouts can use `origin/feat/geometry-eval`. It requires USGS LiDAR coverage or locally supplied LAZ data.
+
+**Texture evaluation:** The score is a confidence from 0 to 1 (1 is best), combining obstruction (O), distortion (D) and realism (F, from an FID against the run's own street photos). The first run downloads Inception-v3 (about 100 MB). If Inception-v3 is unavailable, the score is marked partial (O and D only). Its time is recorded as a separate `evaluate_texture` stage, which `compare.py` leaves out of `compute_s`. Turn it off with `evaluate_texture = false` in `[pipeline]` or `--no-texture-eval`. With an older PSM checkout, it is skipped automatically.
 
 Unavailable evaluations are marked `SKIPPED` with an explanation.
 

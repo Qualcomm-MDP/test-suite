@@ -1,0 +1,84 @@
+{
+ "model": "model.glb",
+ "mode": "pipeline",
+ "confidence": 0.4989,
+ "partial": true,
+ "terms": {
+  "O": 0.8591,
+  "D": 0.0,
+  "F": null
+ },
+ "o_area": 0.8591,
+ "o_texels": 0.4238,
+ "fid": null,
+ "fid_reason": "turned off (--no-fid)",
+ "tau": 100.0,
+ "weights": {
+  "O": 0.35,
+  "D": 0.25,
+  "F": 0.4
+ },
+ "weights_used": {
+  "O": 0.5833,
+  "D": 0.4167
+ },
+ "s_max": 1.5,
+ "k": 2048,
+ "patch": 64,
+ "seed": 0,
+ "device": null,
+ "reference": null,
+ "mask_source": "colour",
+ "counts": {
+  "faces": 1160,
+  "no_chart": 864,
+  "zero_area": 0,
+  "zero_uv_area": 0,
+  "distorted": 0
+ },
+ "seconds": 2.5,
+ "web": {
+  "status": "done",
+  "confidence": 0.4989,
+  "partial": true,
+  "terms": {
+   "O": 0.8591,
+   "D": 0.0,
+   "F": null
+  },
+  "o_texels": 0.4238,
+  "fid": null,
+  "fid_reason": "turned off (--no-fid)",
+  "tau": 100.0,
+  "weights": {
+   "O": 0.35,
+   "D": 0.25,
+   "F": 0.4
+  },
+  "weights_used": {
+   "O": 0.5833,
+   "D": 0.4167
+  },
+  "s_max": 1.5,
+  "reference": null,
+  "mask_source": "colour",
+  "counts": {
+   "faces": 1160,
+   "no_chart": 864,
+   "zero_area": 0,
+   "zero_uv_area": 0,
+   "distorted": 0
+  },
+  "groups": 55,
+  "seconds": 2.5,
+  "files": [
+   "summary.md",
+   "01_scorecard.png",
+   "02_coverage.png",
+   "03_stretch.png",
+   "per_group.csv",
+   "summary.json"
+  ]
+ },
+ "_source": "PSM 9f5dbb6 scripts/eval/eval_texture_uv.py --no-fid on examples run 2's model.glb (Ann Arbor, MacBook M2 Pro); model path replaced, atlases and web.worst dropped"
+}
