@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 from pathlib import Path
 
@@ -126,31 +127,80 @@ def geometry_scores(s: dict) -> dict:
 
 
 def alignment_stats(ctx: dict) -> dict:
-    """PSM's own alignment outputs (pose_alignment/align.py summary.json, stats.json)."""
+    """PSM's COLMAP pose alignment (--poses colmap): its outputs/alignment/mapillary_roi_N/ folder
+    (the one this run created, or --alignment-dir). Copies data/alignment/summary.json and the
+    per-leg stats.json into the run; scores are the headline counts and the step timings."""
     name, source = "pose_alignment_stats", "src/pose_alignment (outputs/alignment/mapillary_roi_*)"
-    if "colmap" not in " ".join(ctx["pipeline_args"]):
+    if "--poses" not in ctx["pipeline_args"] or "colmap" not in ctx["pipeline_args"]:
         return result(name, "SKIPPED", source, reason="only produced with --poses colmap "
-                      "(needs COLMAP 4.2+ and LightGlue); this run did not use it")
-    roots = sorted((ctx["repo"] / "outputs" / "alignment").glob("mapillary_roi_*"),
-                   key=lambda p: p.stat().st_mtime)
-    roots = [r for r in roots if r.stat().st_mtime >= ctx["started"]]
-    if not roots:
-        return result(name, "FAILED", source, reason="no new alignment folder after the run")
+                      "(needs COLMAP 4.2+); this run did not use it")
+    args = ctx["pipeline_args"]
+    if "--alignment-dir" in args:
+        given = Path(args[args.index("--alignment-dir") + 1])
+        roots = [given if given.is_absolute() else ctx["repo"] / given]
+    else:
+        roots = sorted((ctx["repo"] / "outputs" / "alignment").glob("mapillary_roi_*"),
+                       key=lambda p: p.stat().st_mtime)
+        roots = [r for r in roots if r.stat().st_mtime >= ctx["started"]]
+    summ = roots[-1] / "data" / "alignment" / "summary.json" if roots else None
+    if summ is None or not summ.exists():
+        log = ctx["logs"] / "pipeline.log"
+        text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+        m = re.search(r"align_poses: alignment failed \((.+)\); every image keeps", text)
+        return result(name, "FAILED", source, log=str(log),
+                      reason=f"PSM: alignment failed: {m.group(1)}" if m else
+                      ("no alignment folder was created during the run" if not roots else
+                       f"{roots[-1].name} has no data/alignment/summary.json"))
     dest = ctx["run_dir"] / "eval" / "alignment"
-    scores, arts = {}, []
-    for f in list(roots[-1].rglob("summary.json")) + list(roots[-1].rglob("stats.json")):
-        rel = f.relative_to(roots[-1])
+    arts = []
+    for f in [summ, *sorted(summ.parent.glob("*/stats.json"))]:
+        rel = f.relative_to(summ.parent)
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, dest / rel)
         arts.append(str(dest / rel))
-        data = json.loads(f.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            scores.update({f"{rel.parent}/{k}".lstrip("./"): v for k, v in data.items()
-                           if isinstance(v, (int, float))})
-    return result(name, "OK", source, scores=scores, artifacts=arts,
-                  units="see PSM align.py (metres, counts, seconds)",
-                  interpretation="points_to_footprint_* = distance of reconstructed points to OSM "
-                  "walls (lower is better); frames_aligned/reliable = images given a COLMAP pose")
+    s = json.loads(summ.read_text(encoding="utf-8"))
+    return result(name, "OK", source, scores=alignment_scores(s, roots[-1].name), artifacts=arts,
+                  units="counts; shares 0-1; seconds",
+                  interpretation="frames = photos given to COLMAP; frames_aligned = given an aligned "
+                  "pose; frames_reliable = aligned and passing PSM's reliability checks. A leg is a "
+                  "stretch of street; a piece is one capture sequence's photos on a leg. wall_fit_* = "
+                  "median over aligned pieces of the reconstructed points' distance to the OSM walls "
+                  "(m, lower is better) and share within 1 m, with Mapillary's poses (before) and "
+                  "aligned (after). fit_s_* = "
+                  "PSM's final fitting step (align.py: reconstructed legs onto OSM walls) only; the "
+                  "align_poses stage time also covers the photo download, masking and the COLMAP "
+                  "reconstruction, which run as subprocesses")
+
+
+def wall_fit(pieces: list[dict]) -> dict:
+    """How well each aligned piece's reconstructed points sit on the OSM walls (align.py
+    points_to_footprint), before (Mapillary's poses) and after alignment: the median over pieces
+    of each piece's median distance (m) and of its share of points within 1 m. Lower m is better."""
+    def med(vals):
+        vals = [v for v in vals if isinstance(v, (int, float))]
+        return round(statistics.median(vals), 3) if vals else None
+    ptf = [p.get("points_to_footprint") or {} for p in pieces]
+    return {"wall_fit_median_m_before": med((x.get("before") or {}).get("median_m") for x in ptf),
+            "wall_fit_median_m_after": med((x.get("after") or {}).get("median_m") for x in ptf),
+            "wall_within_1m_before": med((x.get("before") or {}).get("within_1m") for x in ptf),
+            "wall_within_1m_after": med((x.get("after") or {}).get("within_1m") for x in ptf)}
+
+
+def alignment_scores(s: dict, roi: str | None = None) -> dict:
+    frames, aligned, reliable = s.get("frames"), s.get("frames_aligned"), s.get("frames_reliable")
+    pieces = s.get("legs") or []  # align.py: one entry per (leg, capture sequence)
+    share = lambda n: round(n / frames, 4) if frames and isinstance(n, (int, float)) else None  # noqa: E731
+    return {"roi_folder": roi, "frames": frames, "frames_aligned": aligned, "frames_reliable": reliable,
+            "aligned_share": share(aligned), "reliable_share": share(reliable),
+            "legs": len({p.get("leg") for p in pieces}),
+            "legs_aligned": len({p.get("leg") for p in pieces if p.get("aligned")}),
+            "pieces": len(pieces), "pieces_aligned": sum(1 for p in pieces if p.get("aligned")),
+            **wall_fit([p for p in pieces if p.get("aligned")]),
+            "features": (s.get("reconstruction") or {}).get("features"),
+            "mapper": (s.get("reconstruction") or {}).get("mapper"),
+            # aggregate step times only (align.py also writes one "fit legNN" entry per leg)
+            **{f"fit_s_{k}": v for k, v in (s.get("seconds") or {}).items()
+               if isinstance(v, (int, float)) and re.fullmatch(r"[a-z_]+", k)}}
 
 
 def image_metrics(ctx: dict) -> dict:

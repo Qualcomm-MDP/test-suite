@@ -87,6 +87,28 @@ def markdown(s: dict) -> str:
             L.append("| " + " | ".join([k] + [_f(g.get(f"{k}_{st}")) for st in
                      ("n", "bias_mean", "median", "rmse", "mae", "nmad", "within_1m", "within_3m")]) + " |")
         L += ["", f"Building status: {g.get('building_status_counts')}", ""]
+    cm = p.get("colmap") or {}
+    if cm.get("used"):
+        L += [f"COLMAP: {cm.get('path') or 'not found'} — version {cm.get('version') or 'unknown'}, "
+              f"{'with' if cm.get('cuda') else 'without'} CUDA ({cm.get('source')})", ""]
+    al = next((e for e in s["evaluations"] if e["name"] == "pose_alignment_stats" and e["status"] == "OK"), None)
+    if al:
+        x = al["scores"]
+        L += ["### Pose alignment (COLMAP)", "",
+              "| frames | aligned | reliable | aligned share | reliable share | legs aligned | pieces aligned |",
+              "|--:|--:|--:|--:|--:|--:|--:|",
+              f"| {_f(x.get('frames'))} | {_f(x.get('frames_aligned'))} | {_f(x.get('frames_reliable'))} | "
+              f"{_f(x.get('aligned_share'))} | {_f(x.get('reliable_share'))} | "
+              f"{_f(x.get('legs_aligned'))}/{_f(x.get('legs'))} | {_f(x.get('pieces_aligned'))}/{_f(x.get('pieces'))} |", ""]
+        if x.get("wall_fit_median_m_after") is not None:
+            L += [f"Points to OSM walls (median over pieces): {_f(x.get('wall_fit_median_m_before'), '{:.2f}')} m "
+                  f"with Mapillary's poses -> {_f(x.get('wall_fit_median_m_after'), '{:.2f}')} m aligned; "
+                  f"within 1 m: {_f(x.get('wall_within_1m_before'), '{:.2f}')} -> "
+                  f"{_f(x.get('wall_within_1m_after'), '{:.2f}')}.", ""]
+        steps = {k[6:]: v for k, v in x.items() if k.startswith("fit_s_")}
+        if steps:
+            L += ["Final fitting step (align.py) times, s: " + ", ".join(f"{k} {_f(v, '{:.1f}')}" for k, v in steps.items())
+                  + ". The align_poses stage also includes the photo download, masking and COLMAP.", ""]
     tex = next((e for e in s["evaluations"] if e["name"] == "texture_quality_uv_fid" and e["status"] == "OK"), None)
     if tex:
         x = tex["scores"]

@@ -6,6 +6,7 @@ Relative paths in the config file are resolved against the config file's folder.
 from __future__ import annotations
 
 import os
+import shutil
 import tomllib
 from pathlib import Path
 
@@ -16,7 +17,7 @@ POSES = ("raw", "computed", "colmap")
 TEXTURES = ("blend", "best")
 
 DEFAULTS = {
-    "psm": {"dir": "", "python": ""},
+    "psm": {"dir": "", "python": "", "colmap": ""},
     "region": {"name": "", "bbox": [], "location": "", "center": [], "size_km": 0.0,
                "max_area_km2": 2.0},
     # Each key maps to a real src/main.py option (PSM 767fbaa); see pipeline_args().
@@ -123,6 +124,21 @@ def _interpreter(value: str, base: Path) -> Path:
     base interpreter, and only the symlink's own path activates the environment's packages."""
     q = Path(os.path.expandvars(value)).expanduser()
     return Path(os.path.abspath(q if q.is_absolute() else base / q))
+
+
+def resolve_colmap(cfg: dict, base: Path, repo: Path) -> tuple[str | None, str]:
+    """COLMAP executable for --poses colmap: psm.colmap > $COLMAP_BIN > COLMAP_BIN in <PSM>/.env >
+    `colmap` on PATH. Symlinks are kept (a conda env's bin/colmap finds its libraries itself)."""
+    for source, value, rel in (("config psm.colmap", cfg["psm"]["colmap"], base),
+                               ("COLMAP_BIN", os.environ.get("COLMAP_BIN"), Path.cwd()),
+                               ("<PSM>/.env COLMAP_BIN", pipeline.env_file_value(repo, "COLMAP_BIN"), repo)):
+        if value:
+            exe = _interpreter(value, rel)
+            if not exe.exists():
+                raise ValueError(f"{source} = {exe} does not exist")
+            return str(exe), source
+    found = shutil.which("colmap")
+    return (found, "PATH") if found else (None, "not found")
 
 
 def resolve_python(cli: str | None, cfg: dict, base: Path, repo: Path) -> tuple[str | None, str]:

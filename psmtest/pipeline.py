@@ -106,6 +106,39 @@ def main_supports(repo: Path, flag: str) -> bool:
         return False
 
 
+def env_file_value(repo: Path, key: str) -> str | None:
+    """KEY=value from <PSM>/.env (PSM loads it with python-dotenv), unquoted; None if absent."""
+    env = repo / ".env"
+    if not env.exists():
+        return None
+    m = re.search(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=\s*(.*?)\s*$",
+                  env.read_text(encoding="utf-8", errors="replace"), re.M)
+    if not m:
+        return None
+    return m.group(1).strip("\"'") or None
+
+
+MIN_COLMAP = (4, 2)  # PSM's reconstruct.py uses COLMAP 4 pose priors / sensor types (README: 4.2+)
+
+
+def colmap_info(exe: str | None) -> dict:
+    """Version and CUDA support from `colmap help`'s first line, e.g.
+    'COLMAP 4.2.1 (Commit Unknown on Unknown with CUDA, std hash maps)'."""
+    if not exe:
+        return {"path": None, "version": None, "cuda": None, "version_ok": False}
+    try:
+        r = subprocess.run([exe, "help"], capture_output=True, encoding="utf-8", errors="replace",
+                           timeout=60)
+        first = next((l for l in (r.stdout + r.stderr).splitlines() if l.startswith("COLMAP")), "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"path": exe, "version": None, "cuda": None, "version_ok": False, "error": str(e)}
+    m = re.match(r"COLMAP (\d+)\.(\d+)(?:\.(\d+))?", first)
+    ver = tuple(int(x) for x in m.groups() if x is not None) if m else None
+    return {"path": exe, "version": ".".join(map(str, ver)) if ver else None,
+            "cuda": ("with CUDA" in first) if first else None,
+            "version_ok": bool(ver and ver[:2] >= MIN_COLMAP), "banner": first or None}
+
+
 def has_token(repo: Path) -> bool:
     if os.environ.get("MAPILLARY_ACCESS_TOKEN"):
         return True
@@ -174,7 +207,10 @@ def parse_profile(path: Path) -> dict:
             "started_at": p.get("started_at"), "profiler_system": p.get("system"), "stages": stages,
             "notes": ["py_heap_* is tracemalloc (Python heap only: no torch/OpenCV buffers, no "
                       "subprocesses)", "cuda_* are CUDA only (start/end snapshots, no peak); MPS "
-                      "use is not recorded by PSM's profiler"]}
+                      "use is not recorded by PSM's profiler",
+                      "cpu_time_s and cuda_* cover PSM's own process only: with --poses colmap the "
+                      "alignment (feature matching, COLMAP) runs in subprocesses, so align_poses "
+                      "shows far less CPU time and GPU memory than it really used"]}
 
 
 def ml_devices(text: str, expected: str | None) -> dict:

@@ -28,6 +28,10 @@ def row(s: dict) -> dict:
     g = geo.get("scores", {})
     tex = next((e for e in s.get("evaluations", []) if e["name"] == "texture_quality_uv_fid"), {})
     tx = tex.get("scores", {})
+    al = next((e for e in s.get("evaluations", []) if e["name"] == "pose_alignment_stats"), {})
+    ax = al.get("scores", {})
+    cm = p.get("colmap") or {}
+    args = p["pipeline_args"]
     st = perf.get("stages", [])
     stages = {x["name"]: x.get("wall_time_s") for x in st}
     total, fetch = perf.get("total_wall_time_s"), stages.get("fetch")
@@ -47,6 +51,8 @@ def row(s: dict) -> dict:
             "bbox": f"{b['west']},{b['south']},{b['east']},{b['north']}", "km2": loc["area_km2"],
             "psm": p["git"].get("short"), "suite": ((s.get("suite") or {}).get("commit") or "")[:7] or None,
             "options": " ".join(p["pipeline_args"]), "status": s["status"],
+            "poses": args[args.index("--poses") + 1] if "--poses" in args[:-1] else "raw",
+            "colmap": (f"{cm.get('version')}{'+cuda' if cm.get('cuda') else ''}" if cm.get("used") else None),
             "degraded": " ".join(p.get("degraded") or []) or None,
             "total_s": total,
             # fetch is network-bound and evaluate_* stages are scoring, not map making: the rest
@@ -54,8 +60,8 @@ def row(s: dict) -> dict:
             "compute_s": round(total - fetch - sum(stages.get(k) or 0 for k in EVAL_STAGES), 4)
             if total is not None and fetch is not None else None,
             "cpu_s": perf.get("total_cpu_time_s"), "min/km2": perf.get("min_per_km2"),
-            **{f"{k}_s": stages.get(k) for k in ("fetch", "terrain", "build_mesh", "texturing", "export",
-                                                  "evaluate_texture")},
+            **{f"{k}_s": stages.get(k) for k in ("fetch", "align_poses", "terrain", "build_mesh", "texturing",
+                                                  "export", "evaluate_texture")},
             "max_rss_mb": p.get("max_process_rss_mb"),
             "py_heap_peak_mb": _max(x.get("py_heap_peak_mb") for x in st),
             "cuda_reserved_max_mb": _max((x.get("cuda_end") or {}).get("reserved_mb") for x in st),
@@ -66,7 +72,11 @@ def row(s: dict) -> dict:
             "terrain_QR06a": g.get("terrain_QR06a"),
             "texture": tex.get("status"), "tex_confidence": tx.get("confidence"),
             "tex_partial": tx.get("partial"), "tex_O": tx.get("O_obstruction"),
-            "tex_D": tx.get("D_distortion"), "tex_F": tx.get("F_realism"), "tex_fid": tx.get("fid")}
+            "tex_D": tx.get("D_distortion"), "tex_F": tx.get("F_realism"), "tex_fid": tx.get("fid"),
+            "alignment": al.get("status"), "frames": ax.get("frames"),
+            "aligned_share": ax.get("aligned_share"), "reliable_share": ax.get("reliable_share"),
+            "wall_fit_before_m": ax.get("wall_fit_median_m_before"),
+            "wall_fit_after_m": ax.get("wall_fit_median_m_after")}
 
 
 def main():
@@ -80,10 +90,13 @@ def main():
     fmt = lambda v: "–" if v is None else f"{v:.2f}" if isinstance(v, float) else str(v)  # noqa: E731
     md = "\n".join(["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
                    + ["| " + " | ".join(fmt(r[c]) for c in cols) + " |" for r in rows])
-    differ = [c for c in ("bbox", "psm", "suite", "options", "machine", "torch", "weights")
+    differ = [c for c in ("bbox", "psm", "suite", "options", "poses", "machine", "torch", "weights")
               if len({r[c] for r in rows}) > 1]
     if differ and len(rows) > 1:
         md += "\n\nThese differ between runs: " + ", ".join(differ)
+    if len({r["poses"] for r in rows}) > 1:
+        md += ("\n\nposes differ: with colmap, texturing reuses the alignment's photos and class maps, "
+               "so that work moves from texturing_s into align_poses_s; compare compute_s, not stages.")
     if any(r["weights"] == "downloaded" for r in rows):
         md += ("\n\nRuns with weights=downloaded include one-time model downloads in their timings "
                "(cold start); compare them with care.")

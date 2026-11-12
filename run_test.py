@@ -69,6 +69,8 @@ def parse_args(argv=None):
     ap.add_argument("--machine-label", help="overrides $PSM_MACHINE_LABEL, config, hostname")
     ap.add_argument("--no-terrain", action="store_true")
     ap.add_argument("--no-seg", action="store_true")
+    ap.add_argument("--poses", choices=config.POSES,
+                    help="camera poses (overrides pipeline.poses); colmap needs COLMAP 4.2+")
     ap.add_argument("--no-evals", action="store_true", help="skip evaluations")
     ap.add_argument("--no-texture-eval", action="store_true",
                     help="don't pass --evaluate-texture to PSM (no UV texture score)")
@@ -93,6 +95,8 @@ def settings(a) -> tuple[dict, Path]:
             r[key] = val
     if a.no_terrain:
         p["terrain"] = False
+    if a.poses:
+        p["poses"] = a.poses
     if a.no_seg:
         p["segmentation"] = False
     p["extra_args"] = list(p["extra_args"]) + a.pipeline_args
@@ -123,6 +127,24 @@ def texture_eval_plan(args: list[str], repo: Path) -> dict:
     return {"requested": True, "dropped": False, "reason": None}
 
 
+def colmap_plan(cfg: dict, base: Path, repo: Path) -> dict:
+    """COLMAP for poses = colmap: where it is, its version and CUDA support. Without a usable
+    one PSM still runs but keeps Mapillary's poses (the run is then completed_degraded)."""
+    if cfg["pipeline"]["poses"] != "colmap":
+        return {"used": False, "check": f"not used (poses = {cfg['pipeline']['poses']})"}
+    exe, source = config.resolve_colmap(cfg, base, repo)
+    info = {"used": True, "source": source, **pipeline.colmap_info(exe)}
+    if not exe:
+        info["warning"] = ("poses = colmap but COLMAP was not found (set psm.colmap in config.toml, "
+                           "$COLMAP_BIN or COLMAP_BIN in <PSM>/.env); PSM will keep Mapillary's poses")
+    elif not info["version_ok"]:
+        info["warning"] = (f"COLMAP at {exe} reports version {info['version'] or 'unknown'}; PSM needs "
+                           f"{'.'.join(map(str, pipeline.MIN_COLMAP))}+ and its alignment may fail")
+    info["check"] = (f"{exe} ({source}): COLMAP {info['version']}, "
+                     f"{'with' if info['cuda'] else 'without'} CUDA" if exe else "NOT FOUND")
+    return info
+
+
 def new_run_dir(results: Path, stem: str) -> Path:
     """A fresh folder; never reuses one from an earlier run."""
     results.mkdir(parents=True, exist_ok=True)
@@ -143,6 +165,7 @@ def main(argv=None) -> int:
         r, p, t, ev = cfg["region"], cfg["pipeline"], cfg["test"], cfg["evaluation"]
         repo, repo_src = config.resolve_psm(a.psm_dir, cfg, base)
         py, py_src = config.resolve_python(a.python, cfg, base, repo)
+        colmap = colmap_plan(cfg, base, repo)
         loc = location.resolve(r["location"] or None, r["bbox"] or None, r["center"] or None,
                                r["size_km"] or None, r["max_area_km2"])
     except (ValueError, OSError) as e:
@@ -163,10 +186,13 @@ def main(argv=None) -> int:
     checks = {"psm_dir": f"{repo} ({repo_src})", "pipeline_python": f"{py} ({py_src})",
               "mapillary_token": pipeline.has_token(repo) if not glb_given else "not needed",
               "evaluations": t["run_evaluations"],
-              "texture_evaluation": "on" if texture_eval["requested"] else texture_eval["reason"]}
+              "texture_evaluation": "on" if texture_eval["requested"] else texture_eval["reason"],
+              "colmap": colmap["check"]}
     print(json.dumps({"config": a.config, "location": loc, "psm": gitinfo, "checks": checks,
                       "compute": machine["compute"], "expected_ml_device": machine["expected_ml_device"],
                       "pipeline_args": args, "results_dir": str(results_dir)}, indent=1))
+    if colmap.get("warning"):
+        print(f"warning: {colmap['warning']}", file=sys.stderr)
     if not py:
         print("error: PSM interpreter not found (set psm.python, $PSM_PYTHON or --python)", file=sys.stderr)
         return 2
@@ -183,6 +209,8 @@ def main(argv=None) -> int:
     logs.mkdir()
     art.mkdir()
     env = pipeline.utf8_env({**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PSM_ENV_DIR": str(repo)})
+    if colmap.get("path"):  # PSM's align_poses reads COLMAP_BIN (it overrides <PSM>/.env)
+        env["COLMAP_BIN"] = colmap["path"]
 
     before = pipeline.repo_snapshot(repo)
     started = time.time()
@@ -234,6 +262,7 @@ def main(argv=None) -> int:
                      "pipeline_args": args, "status": status, **res,
                      **{k: scan[k] for k in ("degraded", "flagged_buildings", "error_lines")},
                      "ml_devices": devices, "model_downloads": downloads,
+                     "colmap": {k: v for k, v in colmap.items() if k != "check"},
                      "glb": rel(glb, run_dir) if glb.exists() else None,
                      "repo_changes": sorted(after - before) if before is not None and after is not None else None},
         "performance": perf, "evaluations": results,

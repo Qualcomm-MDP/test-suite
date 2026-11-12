@@ -8,6 +8,9 @@
 dir = ""
 # PSM's Python interpreter. Empty: $PSM_PYTHON, else <PSM>/.venv, else `poetry env info -e`.
 python = ""
+# COLMAP 4.2+ executable, used only with poses = "colmap". Empty: $COLMAP_BIN, else COLMAP_BIN in
+# <PSM>/.env, else `colmap` on PATH. Example: "~/.conda/envs/colmap/bin/colmap"
+colmap = ""
 
 [region]
 name = "Ann Arbor"

@@ -27,12 +27,45 @@ PROFILE = {"pipeline": "photorealistic-street-maps", "total_wall_time_s": 12.5,
                        "peak_memory_mb": 0.0, "memory_delta_mb": 0.0, "gpu_delta_allocated_mb": "N/A",
                        "throughput": {}, "error": None}]}
 
+# Shape of PSM's data/alignment/summary.json (pose_alignment/align.py, PSM 9f5dbb6)
+ALIGN_SUMMARY = {"pipeline": "Alignment_Pipeline",
+                 "reconstruction": {"features": "aliked", "mapper": "global", "refine_intrinsics": True,
+                                    "gravity_priors": True, "mask_moving": True},
+                 "frames": 40, "leg_links": [], "frames_aligned": 30, "frames_reliable": 24,
+                 "legs": [{"leg": 0, "folder": "seqA", "aligned": True, "registered": 30, "reliable": True},
+                          {"leg": 1, "folder": "seqB", "aligned": False, "registered": 0, "reliable": False}],
+                 "seconds": {"place_linked_legs": 1.25, "figures": 3.5, "total": 12.0}}
+FAKE_COLMAP = "#!/bin/sh\necho 'COLMAP VERSION (Commit Unknown on Unknown CUDA_PART, std hash maps)'\necho 'Usage:'\n"
+
+
+def fake_colmap(folder: Path, version="4.2.1", cuda=True) -> Path:
+    exe = folder / "colmap"
+    exe.write_text(FAKE_COLMAP.replace("VERSION", version).replace("CUDA_PART", "with CUDA" if cuda else "without CUDA"),
+                   encoding="utf-8")
+    exe.chmod(0o755)
+    return exe
+
+
 FAKE_MAIN = textwrap.dedent("""
     import argparse, json, os, shutil, sys
+    ALIGN_SUMMARY_JSON = ALIGN_REPR
     ap = argparse.ArgumentParser()
     ap.add_argument("--bbox", nargs=4); ap.add_argument("--output"); ap.add_argument("--profile")
     ap.add_argument("--dump-mapillary"); ap.add_argument("--terrain", action="store_true")
+    ap.add_argument("--poses", default="raw")
     a = ap.parse_args()
+    if a.poses == "colmap":  # PSM's align_poses: needs COLMAP_BIN (or colmap on PATH)
+        exe = os.environ.get("COLMAP_BIN")
+        if exe and os.path.exists(exe):
+            root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "outputs", "alignment", "mapillary_roi_1", "data", "alignment")
+            os.makedirs(os.path.join(root, "leg0_seqA"))
+            json.dump(ALIGN, open(os.path.join(root, "summary.json"), "w", encoding="utf-8"))
+            json.dump({"aligned": True, "registered": 30}, open(os.path.join(root, "leg0_seqA", "stats.json"),
+                                                                 "w", encoding="utf-8"))
+        else:
+            print("align_poses: alignment failed (COLMAP not found: install it, or set COLMAP_BIN in "
+                  ".env to its executable); every image keeps Mapillary's computed pose")
     print("fetch ...")
     print("\u2713 Completed: fetch (1/7)")  # PSM common/ProgressMonitor.py prints this mark
     print("Downloading images:  50%|#####     | 1/2 [00:01<00:01,  1.0it/s]")  # Mapillary, not weights
@@ -58,7 +91,7 @@ FAKE_MAIN = textwrap.dedent("""
         elif mode == "failed":
             print("Texture evaluation failed: RuntimeError: CUDA out of memory. The model is kept.")
     json.dump(PROFILE, open(a.profile, "w", encoding="utf-8"))
-""").replace("PROFILE", repr(PROFILE))
+""").replace("PROFILE", repr(PROFILE)).replace("ALIGN_REPR", repr(ALIGN_SUMMARY)).replace("json.dump(ALIGN,", "json.dump(ALIGN_SUMMARY_JSON,")
 TEXTURE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "texture_summary.json"  # real PSM output
 
 
@@ -158,6 +191,8 @@ class CompareSchemas(unittest.TestCase):
         self.assertAlmostEqual(r["compute_s"], r["total_s"] - r["fetch_s"], places=6)
         self.assertEqual(r["M1_rmse_m"], self.old["evaluations"][0]["scores"]["M1_height_err_rmse"])
         self.assertIsNone(r["M1_bias_m"])            # not copied into psm-test/1 summaries
+        self.assertEqual((r["poses"], r["colmap"], r["alignment"], r["aligned_share"]),
+                         ("raw", None, "SKIPPED", None))
 
     def test_new_schema_and_mixed_table(self):
         r = self.compare.row(self.new)
@@ -196,6 +231,26 @@ class CompareSchemas(unittest.TestCase):
         self.assertAlmostEqual(r["compute_s"], old["compute_s"], places=6)  # scoring time left out
         self.assertEqual(r["total_s"], old["total_s"] + 30.0)
         self.assertEqual((old["texture"], old["tex_confidence"]), ("SKIPPED", None))  # psm-test/1 example
+
+    def test_colmap_columns(self):
+        self.new["pipeline"]["pipeline_args"] = ["--terrain", "--poses", "colmap"]
+        self.new["pipeline"]["colmap"] = {"used": True, "version": "4.2.1", "cuda": True}
+        self.new["evaluations"] = [e for e in self.new["evaluations"] if e["name"] != "pose_alignment_stats"]
+        self.new["evaluations"].append(evals.result("pose_alignment_stats", "OK", "x",
+                                                    scores=evals.alignment_scores(ALIGN_SUMMARY)))
+        r = self.compare.row(self.new)
+        self.assertEqual((r["poses"], r["colmap"], r["alignment"], r["frames"], r["aligned_share"]),
+                         ("colmap", "4.2.1+cuda", "OK", 40, 0.75))
+        self.assertIn("align_poses_s", r)
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for name, s in (("old", self.old), ("new", self.new)):
+                paths.append(Path(d) / f"{name}.json")
+                paths[-1].write_text(json.dumps(s), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["compare.py", *map(str, paths)]), mock.patch("sys.stdout") as so:
+                self.compare.main()
+            printed = "".join(c.args[0] for c in so.write.call_args_list)
+        self.assertIn("poses differ", printed)
 
     def test_report_renders_both(self):
         from psmtest import report
@@ -318,6 +373,98 @@ class DevicesAndDownloads(unittest.TestCase):
             self.assertEqual(pipeline.model_cache_dirs({"HF_HOME": "/h"})["huggingface"], Path("/h/hub"))
 
 
+@unittest.skipIf(os.name == "nt", "fake colmap is a shell script")
+class Colmap(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = Path(self.tmp.name)
+        self.repo = self.t / "PSM"
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / "src" / "main.py").write_text("", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_info_from_banner(self):
+        new = pipeline.colmap_info(str(fake_colmap(self.t)))
+        self.assertEqual((new["version"], new["cuda"], new["version_ok"]), ("4.2.1", True, True))
+        (self.t / "old").mkdir()
+        old = pipeline.colmap_info(str(fake_colmap(self.t / "old", "3.9.1", cuda=False)))
+        self.assertEqual((old["version"], old["cuda"], old["version_ok"]), ("3.9.1", False, False))
+        self.assertFalse(pipeline.colmap_info(None)["version_ok"])
+        self.assertIn("error", pipeline.colmap_info(str(self.t / "missing")))
+
+    def test_env_file_value(self):
+        (self.repo / ".env").write_text('MAPILLARY_ACCESS_TOKEN="secret"\nexport COLMAP_BIN="/opt/c/colmap"\n',
+                                        encoding="utf-8")
+        self.assertEqual(pipeline.env_file_value(self.repo, "COLMAP_BIN"), "/opt/c/colmap")
+        self.assertIsNone(pipeline.env_file_value(self.repo, "NOPE"))
+        self.assertIsNone(pipeline.env_file_value(self.t, "COLMAP_BIN"))  # no .env
+
+    def test_resolve_precedence(self):
+        cfg, base = config.load(None)
+        a, b, c = (fake_colmap(self.t / d) for d in ("a", "b", "c") if (self.t / d).mkdir() is None)
+        (self.repo / ".env").write_text(f"COLMAP_BIN={c}\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"COLMAP_BIN": str(b)}):
+            self.assertEqual(config.resolve_colmap(dict(cfg, psm={**cfg["psm"], "colmap": str(a)}), base, self.repo),
+                             (str(a), "config psm.colmap"))
+            self.assertEqual(config.resolve_colmap(cfg, base, self.repo), (str(b), "COLMAP_BIN"))
+        with mock.patch.dict(os.environ, {"COLMAP_BIN": ""}):
+            self.assertEqual(config.resolve_colmap(cfg, base, self.repo), (str(c), "<PSM>/.env COLMAP_BIN"))
+            (self.repo / ".env").unlink()
+            with mock.patch.object(config.shutil, "which", return_value=None):
+                self.assertEqual(config.resolve_colmap(cfg, base, self.repo), (None, "not found"))
+            with self.assertRaises(ValueError):
+                config.resolve_colmap(dict(cfg, psm={**cfg["psm"], "colmap": str(self.t / "nope")}), base, self.repo)
+
+    def test_plan(self):
+        cfg, base = config.load(None)
+        self.assertFalse(run_test.colmap_plan(cfg, base, self.repo)["used"])  # poses = raw
+        cfg["pipeline"]["poses"] = "colmap"
+        with mock.patch.dict(os.environ, {"COLMAP_BIN": str(fake_colmap(self.t))}):
+            plan = run_test.colmap_plan(cfg, base, self.repo)
+        self.assertEqual((plan["used"], plan["version"], plan["cuda"]), (True, "4.2.1", True))
+        self.assertNotIn("warning", plan)
+        self.assertIn("COLMAP 4.2.1, with CUDA", plan["check"])
+        with mock.patch.dict(os.environ, {"COLMAP_BIN": ""}), mock.patch.object(config.shutil, "which", return_value=None):
+            plan = run_test.colmap_plan(cfg, base, self.repo)
+        self.assertEqual(plan["check"], "NOT FOUND")
+        self.assertIn("keep Mapillary's poses", plan["warning"])
+
+    def test_alignment_scores(self):
+        x = evals.alignment_scores(ALIGN_SUMMARY, "mapillary_roi_3")
+        self.assertEqual((x["frames"], x["frames_aligned"], x["frames_reliable"]), (40, 30, 24))
+        self.assertEqual((x["aligned_share"], x["reliable_share"]), (0.75, 0.6))
+        self.assertEqual((x["legs"], x["legs_aligned"], x["features"], x["mapper"]), (2, 1, "aliked", "global"))
+        self.assertEqual((x["pieces"], x["pieces_aligned"]), (2, 1))
+        self.assertEqual((x["fit_s_total"], x["roi_folder"]), (12.0, "mapillary_roi_3"))
+        # per-leg timings ("fit leg01") are left out, aggregates kept
+        x = evals.alignment_scores({**ALIGN_SUMMARY, "seconds": {"fit leg01": 4.9, "fit_legs": 78.4}})
+        self.assertEqual([k for k in x if k.startswith("fit_s_")], ["fit_s_fit_legs"])
+        # two capture sequences on one leg: 1 leg, 2 pieces
+        two = {**ALIGN_SUMMARY, "legs": [{"leg": 4, "aligned": True}, {"leg": 4, "aligned": True}]}
+        y = evals.alignment_scores(two)
+        self.assertEqual((y["legs"], y["legs_aligned"], y["pieces"], y["pieces_aligned"]), (1, 1, 2, 2))
+
+    def test_wall_fit(self):
+        def piece(before, after, w_before, w_after, aligned=True):
+            return {"leg": "leg01", "aligned": aligned, "points_to_footprint": {
+                "before": {"median_m": before, "within_1m": w_before},
+                "after": {"median_m": after, "within_1m": w_after}}}
+        pieces = [piece(10.42, 0.80, 0.02, 0.53), piece(4.33, 1.56, 0.13, 0.41), piece(1.41, 1.50, 0.41, 0.40),
+                  piece(99.0, 99.0, 0.0, 0.0, aligned=False)]  # not aligned: left out
+        x = evals.alignment_scores({**ALIGN_SUMMARY, "legs": pieces})
+        self.assertEqual((x["wall_fit_median_m_before"], x["wall_fit_median_m_after"]), (4.33, 1.5))
+        self.assertEqual((x["wall_within_1m_before"], x["wall_within_1m_after"]), (0.13, 0.41))
+        self.assertIsNone(evals.alignment_scores(ALIGN_SUMMARY)["wall_fit_median_m_after"])  # no data
+        self.assertIsNone(evals.alignment_scores({})["aligned_share"])
+
+    def test_poses_cli(self):
+        cfg, _ = run_test.settings(run_test.parse_args(["--poses", "colmap"]))
+        self.assertEqual(cfg["pipeline"]["poses"], "colmap")
+        self.assertIn("colmap", config.pipeline_args(cfg["pipeline"]))
+
+
 class Evaluations(unittest.TestCase):
     def test_geometry_scores(self):
         s = {"requirements": {"terrain": {"result": "PASS", "share": 0.97, "ci95": [0.9, 0.99], "n": 40},
@@ -426,6 +573,37 @@ class EndToEndFake(unittest.TestCase):
         _, s, _ = self._run()
         self.assertNotIn("--evaluate-texture", s["pipeline"]["pipeline_args"])
         self.assertIn("turned off", self._tex(s)["reason"])
+
+    @unittest.skipIf(os.name == "nt", "fake colmap is a shell script")
+    def test_colmap_alignment(self):
+        exe = fake_colmap(Path(self.tmp.name))
+        self.base += ["--poses", "colmap"]
+        _, s, run = self._run({"COLMAP_BIN": str(exe)})
+        self.assertIn("--poses", s["pipeline"]["pipeline_args"])
+        cm = s["pipeline"]["colmap"]
+        self.assertEqual((cm["used"], cm["path"], cm["version"], cm["cuda"], cm["source"]),
+                         (True, str(exe), "4.2.1", True, "COLMAP_BIN"))
+        al = next(e for e in s["evaluations"] if e["name"] == "pose_alignment_stats")
+        self.assertEqual(al["status"], "OK", al["reason"])
+        self.assertEqual((al["scores"]["frames_aligned"], al["scores"]["aligned_share"]), (30, 0.75))
+        self.assertEqual(al["artifacts"], ["eval/alignment/summary.json", "eval/alignment/leg0_seqA/stats.json"])
+        self.assertEqual(s["status"], "completed_degraded")  # only the fake's "Terrain failed"
+        self.assertNotIn("alignment_failed", s["pipeline"]["degraded"])
+        rep = (run / "report.md").read_text(encoding="utf-8")
+        self.assertIn("### Pose alignment (COLMAP)", rep)
+        self.assertIn("COLMAP: " + str(exe) + " — version 4.2.1, with CUDA", rep)
+
+    def test_colmap_missing(self):
+        self.base += ["--poses", "colmap"]
+        with mock.patch.object(config.shutil, "which", return_value=None):
+            rc, s, _ = self._run({"COLMAP_BIN": ""})
+        self.assertEqual(rc, 0)  # PSM keeps Mapillary's poses and finishes
+        self.assertEqual(s["pipeline"]["colmap"]["path"], None)
+        self.assertIn("alignment_failed", s["pipeline"]["degraded"])
+        self.assertIn("colmap_missing", s["pipeline"]["degraded"])
+        al = next(e for e in s["evaluations"] if e["name"] == "pose_alignment_stats")
+        self.assertEqual(al["status"], "FAILED")
+        self.assertIn("COLMAP not found", al["reason"])
 
     def _run(self, extra_env=None, deps_missing=True):
         t = Path(self.tmp.name)  # model caches in the temp folder: the real caches are never read

@@ -126,10 +126,23 @@ The comparison includes runtime, memory, and geometry scores, and flags differen
 |---|---|
 | Geometry vs. LiDAR (building height, terrain, roof elevation) | Automatic when LiDAR data and dependencies are available |
 | Texture quality (UV mapping: obstruction, distortion, realism/FID) | On by default with PSM `9f5dbb6` or newer; PSM scores it as its own last stage (`--evaluate-texture`) |
-| Pose alignment | Requires COLMAP and `poses = "colmap"` |
+| Pose alignment (COLMAP) | With `poses = "colmap"` (or `--poses colmap`) and COLMAP 4.2+; see below |
 | Image comparison (rendered views vs. photos) | Not connected; marked `SKIPPED` |
 
 **Geometry evaluation setup:** The evaluator is part of PSM's main branch; older PSM checkouts can use `origin/feat/geometry-eval`. It requires USGS LiDAR coverage or locally supplied LAZ data.
+
+**COLMAP pose alignment:** PSM reconstructs where each photo was taken (ALIKED/LightGlue features on the GPU, then COLMAP) instead of using Mapillary's positions. Install COLMAP 4.2 or newer:
+
+- macOS: `brew install colmap`
+- Linux, including clusters without root (prebuilt from conda-forge; pick the CUDA build that suits your driver, `cuda_129` or `cuda_134`):
+
+  ```bash
+  CONDA_OVERRIDE_CUDA=12.9 mamba create -p ~/.conda/envs/colmap -c conda-forge --override-channels "colmap=4.2.1=cuda_129*"
+  ```
+
+  `CONDA_OVERRIDE_CUDA` is only needed when installing on a machine without a GPU, such as a login node. The environment takes about 7 GB.
+
+Then set `colmap = "~/.conda/envs/colmap/bin/colmap"` under `[psm]` (or `$COLMAP_BIN`, or `COLMAP_BIN` in PSM's `.env`) and run with `--poses colmap`. The dry run shows the COLMAP version and whether it was built with CUDA, and each run records them in `summary.json`. Without a usable COLMAP, PSM keeps Mapillary's poses; the run is then `completed_degraded` and the alignment evaluation `FAILED` with PSM's reason. With COLMAP, texturing reuses the photos and segmentation the alignment already made, so that work moves from the `texturing` stage into `align_poses`; compare `compute_s` across pose modes, not individual stages. PSM keeps its alignment work in `<PSM>/outputs/alignment/mapillary_roi_N/` (a new folder per run, about 1 GB for the example area; the suite never deletes it, so watch your disk quota); the suite copies its summary into `eval/alignment/`. The results include how far the reconstructed points lie from the OSM walls with Mapillary's poses and after alignment (`wall_fit_*`). PSM's profiler cannot see the alignment's subprocesses, so `align_poses` shows much less CPU time and GPU memory than it really uses.
 
 **Texture evaluation:** The score is a confidence from 0 to 1 (1 is best), combining obstruction (O), distortion (D) and realism (F, from an FID against the run's own street photos). The first run downloads Inception-v3 (about 100 MB). If Inception-v3 is unavailable, the score is marked partial (O and D only). Its time is recorded as a separate `evaluate_texture` stage, which `compare.py` leaves out of `compute_s`. Turn it off with `evaluate_texture = false` in `[pipeline]` or `--no-texture-eval`. With an older PSM checkout, it is skipped automatically.
 
