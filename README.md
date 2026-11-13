@@ -69,6 +69,36 @@ Additional PSM arguments can be passed after `--`.
 
 The first full run may download approximately 1 GB of model weights.
 
+## Standard Baseline
+
+For results that compare across machines, run the standard benchmark:
+
+```bash
+python3 run_test.py --baseline --dry-run   # check first
+python3 run_test.py --baseline
+```
+
+`--baseline` uses [`configs/baseline.toml`](configs/baseline.toml): the same area (downtown Ann Arbor, 0.0624 km²) with every PSM feature on — terrain, segmentation (Mask2Former), inpainting (LaMa), NAIP aerial photos on ground and roofs, COLMAP pose alignment, and texture scoring — plus all evaluations.
+
+The baseline holds no machine settings. The PSM checkout, PSM's Python, the COLMAP executable and the machine label still come from your own `config.toml` (then `$PSM_REPO`, `$PSM_PYTHON`, `$COLMAP_BIN`, `$PSM_MACHINE_LABEL`, then auto-discovery), so every machine runs the identical file. `summary.json` records both files (`suite.config_file`, `suite.machine_config_file`).
+
+It needs COLMAP 4.2+ and network access for NAIP (US only). Don't edit the baseline for a one-off run; use command-line options instead (e.g. `--baseline --poses raw`), since changing the file changes the benchmark.
+
+## Timing, Downloads and Network
+
+The headline time of every run is **processing time**: PSM's profiler total minus the downloads PSM times on their own and minus the scoring stages. Downloads are reported separately:
+
+| Download | Where | In processing time? |
+|---|---|---|
+| OSM buildings + Mapillary metadata | `fetch` stage | no |
+| Photos, COLMAP runs | the alignment's download step (PSM logs its time) | no |
+| Photos, raw-pose runs | inside `texturing`, in parallel with segmentation/inpainting | **yes** — PSM doesn't time it; flagged as `processing_includes_photo_downloads` |
+| Elevation tiles, NAIP | inside the `terrain` / `naip` stages (a few seconds) | yes |
+
+**Photos** (`pipeline.photos`): how many were used and where they came from — `all_downloaded`, `all_cached`, `partly_cached` — split into cached, downloaded by the alignment, downloaded during texturing, and failed. PSM keeps no photo cache except an earlier COLMAP alignment folder reused with `--alignment-dir`; such runs are also flagged as `alignment_reused` (they skip the download, segmentation and COLMAP, so their times don't compare with full runs). Model weights are a separate cache, reported as cold/warm start.
+
+**Network** (`network` in `summary.json`): before and after the run, the response time of each service PSM downloads from (Mapillary, Overpass, the OSM API, elevation tiles, NAIP) and a ~25 MB download test from Cloudflare's speed-test endpoint; during the run, the bytes the machine received in each stage. The byte count is machine-wide, so on a shared node it includes other jobs' traffic. `--no-network-test` (or `test.network_test = false`) skips the before/after checks.
+
 ## Results and Data Files
 
 Each run creates a new folder under `results/`. Previous runs are never overwritten.
@@ -118,7 +148,7 @@ Collect the result folders in one place, then run:
 python3 compare.py results/*/summary.json --md compare.md --csv compare.csv
 ```
 
-The comparison includes runtime, memory, and geometry scores, and flags differences in configurations or Git commits.
+The comparison includes processing time, download time, wall clock, photo source, network speed, memory, and geometry scores, and flags differences in configurations or Git commits. Older summaries are read too: a raw-pose run's processing time can be derived from them, while a COLMAP run's is shown as `unrecorded` (its photo download time wasn't saved).
 
 ## Evaluations
 

@@ -3,6 +3,7 @@
   python3 -m unittest discover -s tests -v
 """
 
+import io
 import json
 import os
 import shutil
@@ -10,13 +11,19 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
+import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_test  # noqa: E402
-from psmtest import config, evals, hardware, location, pipeline  # noqa: E402
+from psmtest import config, evals, hardware, location, network, pipeline  # noqa: E402
+
+# Keep the developer's own config.toml out of the tests: machine settings are layered from it.
+config.LOCAL_CONFIG = Path(tempfile.gettempdir()) / "psm-suite-tests-no-local-config.toml"
 
 PROFILE = {"pipeline": "photorealistic-street-maps", "total_wall_time_s": 12.5,
            "system": {"gpu": {"available": False}},
@@ -93,6 +100,27 @@ FAKE_MAIN = textwrap.dedent("""
     json.dump(PROFILE, open(a.profile, "w", encoding="utf-8"))
 """).replace("PROFILE", repr(PROFILE)).replace("ALIGN_REPR", repr(ALIGN_SUMMARY)).replace("json.dump(ALIGN,", "json.dump(ALIGN_SUMMARY_JSON,")
 TEXTURE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "texture_summary.json"  # real PSM output
+FAKE_PROBE = {"measured_utc": "2026-11-13T00:00:00+00:00",
+              "latency": {"overpass": {"url": "u", "ok": True, "ms": 40.0, "http_status": 200},
+                          "naip": {"url": "u", "ok": False, "ms": None, "error": "timed out"}},
+              "download": {"url": "u", "ok": True, "bytes": 25_000_000, "seconds": 0.8, "complete": True,
+                           "mbps": 250.0}}
+
+# Excerpts of real PSM 9f5dbb6 logs (Great Lakes A40): a COLMAP run's alignment timing report and
+# texturing's photo loop, and a raw run's photo loop.
+COLMAP_LOG = """\
+  Mapillary: 349 frames of 5 chosen runs (of 846 images near the box)
+align time: osm_buildings 0 s, fit_legs 78 s, link_legs 3 s, place_linked_legs 14 s, figures 16 s, total 112 s
+      download 349 frames                       10.8 s
+Downloading images:   0%|          | 0/349 [00:00<?, ?it/s]
+Downloading images:   1%|          | 3/349 [00:08<14:17,  2.48s/it]
+  Reused from the pose alignment: 349 photos, 349 class maps
+"""
+RAW_LOG = """\
+Downloading images:   0%|          | 0/349 [00:00<?, ?it/s]
+Downloading images:   1%|          | 4/349 [00:09<11:50,  2.06s/it]
+  Download failed [123]: 404 Client Error
+"""
 
 
 class Location(unittest.TestCase):
@@ -188,7 +216,10 @@ class CompareSchemas(unittest.TestCase):
         self.assertEqual(r["torch"], "2.14.1")        # from machine.torch
         self.assertEqual((r["ml_device_used"], r["weights"], r["torch_cuda"]), ("unrecorded",) * 3)
         self.assertEqual(r["ml_device_expected"], "mps")
-        self.assertAlmostEqual(r["compute_s"], r["total_s"] - r["fetch_s"], places=6)
+        # raw poses: processing derivable from an old summary (fetch is its only separate download)
+        self.assertAlmostEqual(r["processing_s"], r["wall_clock_s"] - r["fetch_s"], places=6)
+        self.assertEqual((r["photos"], r["processing_has_photo_downloads"]), ("all_downloaded", "yes"))
+        self.assertEqual((r["net_mbps_before"], r["alignment_reused"]), ("unrecorded", "unrecorded"))
         self.assertEqual(r["M1_rmse_m"], self.old["evaluations"][0]["scores"]["M1_height_err_rmse"])
         self.assertIsNone(r["M1_bias_m"])            # not copied into psm-test/1 summaries
         self.assertEqual((r["poses"], r["colmap"], r["alignment"], r["aligned_share"]),
@@ -228,8 +259,8 @@ class CompareSchemas(unittest.TestCase):
         self.assertEqual((r["texture"], r["tex_confidence"], r["tex_partial"], r["tex_O"], r["tex_F"]),
                          ("OK", raw["confidence"], True, raw["terms"]["O"], None))
         self.assertEqual(r["evaluate_texture_s"], 30.0)
-        self.assertAlmostEqual(r["compute_s"], old["compute_s"], places=6)  # scoring time left out
-        self.assertEqual(r["total_s"], old["total_s"] + 30.0)
+        self.assertAlmostEqual(r["processing_s"], old["processing_s"], places=6)  # scoring time left out
+        self.assertEqual(r["wall_clock_s"], old["wall_clock_s"] + 30.0)
         self.assertEqual((old["texture"], old["tex_confidence"]), ("SKIPPED", None))  # psm-test/1 example
 
     def test_colmap_columns(self):
@@ -501,6 +532,112 @@ class Evaluations(unittest.TestCase):
         self.assertEqual(r[1]["name"], "texture_quality_uv_fid")
 
 
+class PhotosTimingNetwork(unittest.TestCase):
+    def test_photos_raw_all_downloaded_in_texturing(self):
+        ph = pipeline.photo_sources(RAW_LOG, ["--terrain"])
+        self.assertEqual((ph["status"], ph["total"], ph["downloaded_in_texturing"], ph["failed"], ph["cached"]),
+                         ("all_downloaded", 349, 348, 1, 0))
+        self.assertTrue(ph["download_overlaps_processing"])
+        self.assertIn("can't be separated", ph["note"])
+
+    def test_photos_colmap_downloaded_by_alignment(self):
+        ph = pipeline.photo_sources(COLMAP_LOG, ["--poses", "colmap"])
+        self.assertEqual((ph["status"], ph["downloaded_by_alignment"], ph["downloaded_in_texturing"],
+                          ph["alignment_download_s"]), ("all_downloaded", 349, 0, 10.8))
+        self.assertFalse(ph["download_overlaps_processing"])
+
+    def test_photos_cached_from_reused_alignment(self):
+        reused = "\n".join(l for l in COLMAP_LOG.splitlines() if "download 349 frames" not in l)
+        args = ["--poses", "colmap", "--alignment-dir", "outputs/alignment/mapillary_roi_3"]
+        ph = pipeline.photo_sources(reused, args)
+        self.assertEqual((ph["status"], ph["cached"], ph["downloaded_by_alignment"]), ("all_cached", 349, 0))
+        self.assertEqual(ph["alignment_reused_from"], "outputs/alignment/mapillary_roi_3")
+        part = reused.replace("Reused from the pose alignment: 349", "Reused from the pose alignment: 300")
+        ph = pipeline.photo_sources(part, args)
+        self.assertEqual((ph["status"], ph["cached"], ph["downloaded_in_texturing"]), ("partly_cached", 300, 49))
+        self.assertEqual(pipeline.photo_sources("no texturing", [])["status"], "unknown")
+
+    def test_timing_leaves_out_downloads_and_scoring(self):
+        perf = {"total_wall_time_s": 1021.555,
+                "stages": [{"name": "fetch", "wall_time_s": 114.728}, {"name": "align_poses", "wall_time_s": 560.4},
+                           {"name": "texturing", "wall_time_s": 325.2},
+                           {"name": "evaluate_texture", "wall_time_s": 16.381}]}
+        ph = pipeline.photo_sources(COLMAP_LOG, ["--poses", "colmap"])
+        tm = pipeline.timing(perf, ph, COLMAP_LOG)  # numbers of the real A40 COLMAP run
+        self.assertEqual(tm["downloads_s"], {"fetch": 114.728, "alignment_photos": 10.8, "alignment_osm": 0.0})
+        self.assertAlmostEqual(tm["processing_s"], 1021.555 - 114.728 - 10.8 - 16.381, places=3)
+        self.assertFalse(tm["processing_includes_photo_downloads"])
+        self.assertFalse(pipeline.timing({}, ph, "")["available"])
+
+    def test_compare_colmap_without_timing_is_unrecorded(self):
+        import compare
+        s = json.loads(EXAMPLE.read_text(encoding="utf-8")) if EXAMPLE.exists() else None
+        if s is None:
+            self.skipTest("example not present")
+        s["pipeline"]["pipeline_args"] = ["--terrain", "--poses", "colmap"]
+        r = compare.row(s)
+        self.assertEqual((r["processing_s"], r["photos"]), ("unrecorded", "unrecorded"))
+        s["performance"]["timing"] = {"available": True, "processing_s": 879.6, "download_total_s": 125.5,
+                                      "processing_includes_photo_downloads": False}
+        s["pipeline"]["photos"] = {"status": "all_cached", "alignment_reused_from": "roi_3"}
+        s["pipeline"]["alignment_reused"] = "roi_3"
+        s["network"] = {"before": FAKE_PROBE, "during": {"run": {"bytes_received": 2_500_000}}}
+        r = compare.row(s)
+        self.assertEqual((r["processing_s"], r["download_s"], r["photos"], r["processing_has_photo_downloads"]),
+                         (879.6, 125.5, "all_cached", "no"))
+        self.assertEqual((r["net_mbps_before"], r["net_mbps_after"], r["run_rx_mb"], r["alignment_reused"]),
+                         (250.0, None, 2.5, "roi_3"))
+
+    def test_netstat_parsing(self):
+        out = textwrap.dedent("""\
+            Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+            lo0        16384 <Link#1>                         9000     0    5000000     9000     0    5000000     0
+            lo0        16384 127           127.0.0.1          9000     -    5000000     9000     -    5000000     -
+            en0        1500  <Link#11>   aa:bb:cc:dd:ee:ff   12000     0  900000000     8000     0   40000000     0
+            en0        1500  192.168.1     192.168.1.5       12000     -  900000000     8000     -   40000000     -
+            utun0      1380  <Link#20>                           5     0       1000        5     0       1000     0
+        """)
+        self.assertEqual(network.parse_netstat_ibn(out), 900_001_000)  # link rows, no loopback
+        self.assertIsNone(network.parse_netstat_ibn("Name Mtu\n"))
+
+    def test_stage_traffic(self):
+        t0 = 1_800_000_000.0
+        samples = [(t0 + i, i * 1_000_000) for i in range(11)]  # 1 MB/s for 10 s
+        started = datetime.fromtimestamp(t0, timezone.utc).isoformat()
+        d = network.stage_traffic(samples, started, [{"name": "fetch", "wall_time_s": 4.0},
+                                                     {"name": "texturing", "wall_time_s": 6.0}])
+        self.assertEqual(d["run"], {"bytes_received": 10_000_000, "seconds": 10.0, "mbps": 8.0})
+        self.assertEqual([(x["name"], x["bytes_received"], x["mbps"]) for x in d["stages"]],
+                         [("fetch", 4_000_000, 8.0), ("texturing", 6_000_000, 8.0)])
+        self.assertIn("shared node", d["note"])
+        self.assertFalse(network.stage_traffic([], started, [])["available"])
+        self.assertIn("stages_reason", network.stage_traffic(samples, None, []))
+
+    def test_sampler(self):
+        vals = iter(range(0, 10**9, 1000))
+        with network.Sampler(interval=0.01, read=lambda: next(vals)) as s:
+            time.sleep(0.05)
+        self.assertGreaterEqual(len(s.samples), 3)
+        self.assertEqual([v for _, v in s.samples], sorted(v for _, v in s.samples))
+
+    def test_latency_and_speed_without_network(self):
+        class Resp(io.BytesIO):
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        with mock.patch.object(network, "_request", side_effect=lambda url, timeout: Resp(b"x" * 1000)):
+            self.assertTrue(network.latency("https://a")["ok"])
+            sp = network.speed_test(nbytes=1000)
+            self.assertEqual((sp["ok"], sp["bytes"], sp["complete"]), (True, 1000, True))
+        err = urllib.error.HTTPError("https://a", 401, "no token", {}, None)
+        with mock.patch.object(network, "_request", side_effect=err):
+            self.assertEqual((network.latency("https://a")["ok"], network.latency("https://a")["http_status"]),
+                             (True, 401))  # the server answered
+        with mock.patch.object(network, "_request", side_effect=urllib.error.URLError("offline")):
+            self.assertEqual(network.latency("https://a")["ok"], False)
+            self.assertEqual(network.speed_test(nbytes=1000)["ok"], False)
+
+
 class EndToEndFake(unittest.TestCase):
     """run_test.main() against a fake src/main.py run with this interpreter."""
 
@@ -605,13 +742,14 @@ class EndToEndFake(unittest.TestCase):
         self.assertEqual(al["status"], "FAILED")
         self.assertIn("COLMAP not found", al["reason"])
 
-    def _run(self, extra_env=None, deps_missing=True):
+    def _run(self, extra_env=None, deps_missing=True, probe=FAKE_PROBE):
         t = Path(self.tmp.name)  # model caches in the temp folder: the real caches are never read
         env = {"MAPILLARY_ACCESS_TOKEN": "x", "PSM_MACHINE_LABEL": "test-box",
                "HF_HUB_CACHE": str(t / "hf"), "TORCH_HOME": str(t / "torch"), **(extra_env or {})}
         miss = ["laspy"] if deps_missing else []
+        fake = {"return_value": probe} if probe else {"side_effect": AssertionError("network probed")}
         with mock.patch.dict(os.environ, env), mock.patch.object(evals, "missing_modules", return_value=miss), \
-                mock.patch("sys.stdout"):
+                mock.patch.object(network, "probe", **fake), mock.patch("sys.stdout"):
             rc = run_test.main(self.base)
         run = next(self.results.iterdir())
         return rc, json.loads((run / "summary.json").read_text(encoding="utf-8")), run
@@ -638,6 +776,31 @@ class EndToEndFake(unittest.TestCase):
         self.assertEqual(s["pipeline"]["ml_devices"]["status"], "not_observed")
         self.assertEqual(s["pipeline"]["model_downloads"]["status"], "not_downloaded")
         self.assertIn("pipeline_python", s["machine"])
+
+    def test_network_photos_and_timing_recorded(self):
+        _, s, run = self._run()
+        net = s["network"]
+        self.assertEqual((net["before"], net["after"]), (FAKE_PROBE, FAKE_PROBE))
+        self.assertIn("during", net)
+        ph = s["pipeline"]["photos"]  # fake log: "Downloading images: 1/2", raw poses
+        self.assertEqual((ph["status"], ph["total"], ph["downloaded_in_texturing"], ph["cached"]),
+                         ("all_downloaded", 2, 2, 0))
+        self.assertIsNone(s["pipeline"]["alignment_reused"])
+        tm = s["performance"]["timing"]  # fake profile: total 12.5, fetch 4.0
+        self.assertEqual((tm["processing_s"], tm["downloads_s"]["fetch"], tm["wall_clock_s"]), (8.5, 4.0, 12.5))
+        self.assertTrue(tm["processing_includes_photo_downloads"])
+        rep = (run / "report.md").read_text(encoding="utf-8")
+        self.assertIn("**Processing time 8.5 s**", rep)
+        self.assertIn("**Photos:** 2 used, all downloaded during this run", rep)
+        self.assertIn("## Network", rep)
+        self.assertIn("| download speed (Mbit/s, ~25 MB test) | 250.0 | 250.0 |", rep)
+
+    def test_network_test_turned_off(self):
+        self.base.append("--no-network-test")
+        rc, s, _ = self._run(probe=None)  # probe() would raise
+        self.assertEqual(rc, 0)
+        self.assertNotIn("before", s["network"])
+        self.assertIn("during", s["network"])  # bytes received are still sampled
 
     def test_device_and_cold_start_recorded(self):
         _, s, run = self._run({"FAKE_SEG": "1", "FAKE_DOWNLOAD": "1"})
@@ -741,6 +904,59 @@ class Config(unittest.TestCase):
         cfg, _ = config.load(Path(__file__).resolve().parents[1] / "config.example.toml")
         self.assertEqual(cfg["region"]["bbox"], [-83.74998, 42.28025, -83.74695, 42.2825])
         self.assertEqual(config.pipeline_args(cfg["pipeline"]), ["--terrain", "--evaluate-texture"])
+
+    def test_baseline_config(self):
+        """configs/baseline.toml: every PSM feature on, no machine settings, results in results/."""
+        cfg, base = config.load(config.BASELINE)
+        self.assertEqual(config.pipeline_args(cfg["pipeline"]),
+                         ["--terrain", "--naip", "--poses", "colmap", "--evaluate-texture"])
+        self.assertEqual(cfg["region"]["bbox"], [-83.74998, 42.28025, -83.74695, 42.2825])
+        self.assertTrue(cfg["test"]["run_evaluations"])
+        for section, key in config.MACHINE_KEYS:
+            self.assertFalse(cfg[section][key], f"{section}.{key} belongs in each machine's config.toml")
+        self.assertEqual(config._path(cfg["test"]["results_dir"], base), config.SUITE_DIR / "results")
+        a = run_test.parse_args(["--baseline"])
+        self.assertEqual(Path(a.config), config.BASELINE)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            run_test.parse_args(["--baseline", "--config", str(self.cfg_file)])
+
+    def test_machine_settings_layered_from_local_config(self):
+        local = self.t / "suite" / "config.toml"
+        local.parent.mkdir()
+        local.write_text(textwrap.dedent("""
+            [psm]
+            dir = "../cfgPSM"
+            python = "../venv/bin/python"
+            colmap = "/opt/colmap/bin/colmap"
+            [pipeline]
+            poses = "raw"
+            naip = false
+            [test]
+            machine_label = "my-laptop"
+        """), encoding="utf-8")
+        cfg, _ = config.load(config.BASELINE)
+        self.assertEqual(config.layer_machine(cfg, config.BASELINE, local), str(local.resolve()))
+        self.assertEqual(cfg["psm"]["dir"], str((self.t / "cfgPSM").resolve()))  # relative to local file
+        self.assertEqual(cfg["psm"]["python"],
+                         os.path.abspath(local.resolve().parent / ".." / "venv" / "bin" / "python"))
+        self.assertEqual(cfg["psm"]["colmap"], "/opt/colmap/bin/colmap")
+        self.assertEqual(cfg["test"]["machine_label"], "my-laptop")
+        # only machine settings: the baseline's test conditions win
+        self.assertEqual((cfg["pipeline"]["poses"], cfg["pipeline"]["naip"]), ("colmap", True))
+        # the shared file's own machine settings are kept; the local file itself is not layered
+        cfg, _ = config.load(self.cfg_file)
+        config.layer_machine(cfg, self.cfg_file, local)
+        self.assertEqual((cfg["psm"]["dir"], cfg["test"]["machine_label"]), ("../cfgPSM", "cfg-box"))
+        self.assertEqual(cfg["psm"]["colmap"], "/opt/colmap/bin/colmap")
+        self.assertIsNone(config.layer_machine(config.load(local)[0], local, local))
+        self.assertIsNone(config.layer_machine(cfg, self.cfg_file, self.t / "absent.toml"))
+        # through run_test, with the local file in its usual place
+        with mock.patch.object(config, "LOCAL_CONFIG", local):
+            a = run_test.parse_args(["--baseline", "--poses", "raw"])
+            cfg, _ = run_test.settings(a)
+            self.assertEqual(a.machine_config, str(local.resolve()))
+            self.assertEqual(cfg["test"]["machine_label"], "my-laptop")
+            self.assertEqual(cfg["pipeline"]["poses"], "raw")  # command line still wins
 
     def test_invalid(self):
         for text in ('[pipeline]\nposes = "gps"', '[pipeline]\nmin_quality = 2', '[nope]\nx = 1',

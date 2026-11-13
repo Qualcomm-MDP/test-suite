@@ -20,6 +20,24 @@ def _max(vals):
     return max(vals) if vals else None
 
 
+def _timing(perf, p, poses, total, fetch, stages):
+    """(processing_s, download_s, photos, processing_has_photo_downloads). Summaries before the
+    timing split: a raw-pose run's only separate download is fetch (PSM never caches photos and
+    downloads them inside texturing), so it can be derived; a COLMAP run's alignment photo
+    download was not recorded."""
+    tm = perf.get("timing") or {}
+    if tm.get("available"):
+        ph = p.get("photos") or {}
+        return (tm["processing_s"], tm["download_total_s"], ph.get("status"),
+                "yes" if tm.get("processing_includes_photo_downloads") else "no")
+    if total is None or fetch is None:
+        return None, None, UNRECORDED, UNRECORDED
+    if poses == "raw":
+        scoring = sum(stages.get(k) or 0 for k in EVAL_STAGES)
+        return round(total - fetch - scoring, 4), round(fetch, 4), "all_downloaded", "yes"
+    return UNRECORDED, UNRECORDED, UNRECORDED, UNRECORDED
+
+
 def row(s: dict) -> dict:
     """One flat row from a psm-test/1 or psm-test/2 summary. Newer fields missing from an older
     summary come from the older equivalent where one exists, else are 'unrecorded'."""
@@ -37,6 +55,11 @@ def row(s: dict) -> dict:
     total, fetch = perf.get("total_wall_time_s"), stages.get("fetch")
     dev, dl = p.get("ml_devices"), p.get("model_downloads")
     b = loc["bbox"]
+    poses = args[args.index("--poses") + 1] if "--poses" in args[:-1] else "raw"
+    processing, download, photos, overlap = _timing(perf, p, poses, total, fetch, stages)
+    net = s.get("network") or {}
+    speed = lambda k: ((net.get(k) or {}).get("download") or {}).get("mbps") if net else UNRECORDED  # noqa: E731
+    during = (net.get("during") or {}).get("run") or {}
     return {"run": s["run_id"], "schema": s.get("schema"), "machine": m["label"], "os": m.get("os"),
             "cpu": m["cpu"], "cores": m.get("cpu_cores"), "ram_gb": m.get("ram_gb"),
             "gpus": "; ".join(x.get("name", "") for x in m.get("gpus", [])) or None,
@@ -51,14 +74,15 @@ def row(s: dict) -> dict:
             "bbox": f"{b['west']},{b['south']},{b['east']},{b['north']}", "km2": loc["area_km2"],
             "psm": p["git"].get("short"), "suite": ((s.get("suite") or {}).get("commit") or "")[:7] or None,
             "options": " ".join(p["pipeline_args"]), "status": s["status"],
-            "poses": args[args.index("--poses") + 1] if "--poses" in args[:-1] else "raw",
+            "poses": poses,
             "colmap": (f"{cm.get('version')}{'+cuda' if cm.get('cuda') else ''}" if cm.get("used") else None),
+            "alignment_reused": p.get("alignment_reused") if "photos" in p else UNRECORDED,
             "degraded": " ".join(p.get("degraded") or []) or None,
-            "total_s": total,
-            # fetch is network-bound and evaluate_* stages are scoring, not map making: the rest
-            # is what the machine itself does to build the model
-            "compute_s": round(total - fetch - sum(stages.get(k) or 0 for k in EVAL_STAGES), 4)
-            if total is not None and fetch is not None else None,
+            # the headline time: never includes the downloads PSM times or the scoring stages
+            "processing_s": processing, "download_s": download, "wall_clock_s": total,
+            "photos": photos, "processing_has_photo_downloads": overlap,
+            "net_mbps_before": speed("before"), "net_mbps_after": speed("after"),
+            "run_rx_mb": round(during["bytes_received"] / 1e6, 1) if during else (None if net else UNRECORDED),
             "cpu_s": perf.get("total_cpu_time_s"), "min/km2": perf.get("min_per_km2"),
             **{f"{k}_s": stages.get(k) for k in ("fetch", "align_poses", "terrain", "build_mesh", "texturing",
                                                   "export", "evaluate_texture")},
@@ -90,17 +114,29 @@ def main():
     fmt = lambda v: "–" if v is None else f"{v:.2f}" if isinstance(v, float) else str(v)  # noqa: E731
     md = "\n".join(["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
                    + ["| " + " | ".join(fmt(r[c]) for c in cols) + " |" for r in rows])
-    differ = [c for c in ("bbox", "psm", "suite", "options", "poses", "machine", "torch", "weights")
+    differ = [c for c in ("bbox", "psm", "suite", "options", "poses", "machine", "torch", "weights", "photos")
               if len({r[c] for r in rows}) > 1]
     if differ and len(rows) > 1:
         md += "\n\nThese differ between runs: " + ", ".join(differ)
     if len({r["poses"] for r in rows}) > 1:
         md += ("\n\nposes differ: with colmap, texturing reuses the alignment's photos and class maps, "
-               "so that work moves from texturing_s into align_poses_s; compare compute_s, not stages.")
+               "so that work moves from texturing_s into align_poses_s; compare processing_s, not stages.")
+    md += ("\n\nprocessing_s leaves out downloads PSM times on their own (fetch: OSM + Mapillary metadata; "
+           "the alignment's photo download) and scoring; wall_clock_s is everything.")
+    if any(r["processing_has_photo_downloads"] == "yes" for r in rows):
+        md += ("\n\nprocessing_has_photo_downloads=yes: photos were downloaded inside texturing, in parallel "
+               "with its processing (raw poses), so processing_s still includes that download time; "
+               "it depends on the network (see net_mbps_*).")
+    if any(r["photos"] in ("all_cached", "partly_cached") for r in rows) or \
+            any(r["alignment_reused"] not in (None, UNRECORDED) for r in rows):
+        md += ("\n\nSome runs reused cached photos / an earlier alignment (photos, alignment_reused): they "
+               "skip downloads and, with a reused alignment, segmentation and COLMAP. Don't compare their "
+               "times with full runs.")
     if any(r["weights"] == "downloaded" for r in rows):
         md += ("\n\nRuns with weights=downloaded include one-time model downloads in their timings "
                "(cold start); compare them with care.")
-    if any(r[c] == UNRECORDED for r in rows for c in ("ml_device_used", "weights", "torch_cuda")):
+    if any(r[c] == UNRECORDED for r in rows for c in ("ml_device_used", "weights", "torch_cuda", "photos",
+                                                       "net_mbps_before", "processing_s")):
         md += f"\n\n'{UNRECORDED}': the field did not exist in that run's schema (older summary)."
     try:
         print(md)

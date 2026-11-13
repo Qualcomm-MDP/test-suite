@@ -24,7 +24,9 @@ DEFAULTS = {
     "pipeline": {"terrain": True, "segmentation": True, "fill_obstructions": True, "naip": False,
                  "texture": "blend", "poses": "raw", "aligned_only": False, "alignment_dir": "",
                  "min_quality": None, "evaluate_texture": True, "extra_args": []},
-    "test": {"results_dir": "results", "machine_label": "", "run_evaluations": True},
+    # network_test: latency to PSM's services + a ~25 MB speed test, before and after the run
+    "test": {"results_dir": "results", "machine_label": "", "run_evaluations": True,
+             "network_test": True},
     "evaluation": {"geometry_ref": "origin/feat/geometry-eval", "laz": [], "timeout_s": 3600},
 }
 
@@ -48,6 +50,33 @@ def load(path: str | Path | None) -> tuple[dict, Path]:
                 cfg[section][k] = v
     validate(cfg)
     return cfg, base
+
+
+LOCAL_CONFIG = SUITE_DIR / "config.toml"
+BASELINE = SUITE_DIR / "configs" / "baseline.toml"
+# Settings that describe the machine, not the test: a shared config (e.g. the baseline) leaves
+# them empty and each machine's own config.toml fills them in.
+MACHINE_KEYS = (("psm", "dir"), ("psm", "python"), ("psm", "colmap"), ("test", "machine_label"))
+
+
+def layer_machine(cfg: dict, config_file: str | Path | None, local: Path | None = None) -> str | None:
+    """Fill the machine settings that `cfg` leaves empty from the local config.toml, when `cfg`
+    came from a different file. Relative paths are made absolute against the local file's folder,
+    so they mean the same as in that file. Returns the local file used, or None."""
+    local = Path(local or LOCAL_CONFIG).expanduser().resolve()
+    if not config_file or not local.exists() or Path(config_file).expanduser().resolve() == local:
+        return None
+    mine, mine_base = load(local)
+    used = False
+    for section, key in MACHINE_KEYS:
+        value = mine[section][key]
+        if cfg[section][key] or not value:
+            continue
+        if section == "psm":
+            value = str(_path(value, mine_base) if key == "dir" else _interpreter(value, mine_base))
+        cfg[section][key] = value
+        used = True
+    return str(local) if used else None
 
 
 def validate(cfg: dict) -> None:

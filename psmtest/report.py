@@ -30,6 +30,52 @@ def _downloads(d: dict | None) -> str:
     return f"{d['status']}{' (' + what + ')' if what else ''} — {d.get('note')}"
 
 
+PHOTO_STATUS = {"all_downloaded": "all downloaded during this run",
+                "all_cached": "all cached (read from disk, none downloaded)",
+                "partly_cached": "partly cached, partly downloaded", "none": "no photos used",
+                "unknown": "not determined"}
+
+
+def _photos(ph: dict) -> str:
+    if ph.get("total") is None:
+        return f"{PHOTO_STATUS.get(ph.get('status'), ph.get('status'))} — {ph.get('note')}"
+    head = (f"{ph['total']} used, {PHOTO_STATUS.get(ph['status'], ph['status'])} "
+            f"({ph.get('cached', 0)} cached, {ph.get('downloaded_by_alignment', 0)} by the alignment, "
+            f"{ph.get('downloaded_in_texturing', 0)} during texturing, {ph.get('failed', 0)} failed)")
+    return head + (f". {ph['note']}." if ph.get("note") else ".")
+
+
+def _network(net: dict) -> list[str]:
+    if not net or not any(k in net for k in ("before", "after", "during")):
+        return []
+    L = ["## Network", ""]
+    probes = [(k, net[k]) for k in ("before", "after") if net.get(k)]
+    if probes:
+        names = list(probes[0][1]["latency"])
+        L += ["| | " + " | ".join(k for k, _ in probes) + " |", "|---|" + "--:|" * len(probes)]
+        L.append("| download speed (Mbit/s, ~25 MB test) | " + " | ".join(
+            _f(x["download"].get("mbps"), "{:.1f}") for _, x in probes) + " |")
+        for n in names:
+            L.append(f"| latency {n} (ms) | " + " | ".join(
+                _f(x["latency"][n].get("ms"), "{:.0f}") if x["latency"][n].get("ok")
+                else "unreachable" for _, x in probes) + " |")
+        L += ["", f"Measured {', '.join(k + ' ' + x['measured_utc'] for k, x in probes)} (UTC).", ""]
+    d = net.get("during") or {}
+    if d.get("available"):
+        r = d["run"]
+        L += [f"During the run: {r['bytes_received'] / 1e6:.1f} MB received in {r['seconds']:.0f} s "
+              f"(average {_f(r.get('mbps'), '{:.2f}')} Mbit/s).", ""]
+        if d.get("stages"):
+            L += ["| stage | MB received | Mbit/s |", "|---|--:|--:|"]
+            L += [f"| {x['name']} | {_f(None if x['bytes_received'] is None else x['bytes_received'] / 1e6, '{:.1f}')} "
+                  f"| {_f(x['mbps'], '{:.2f}')} |" for x in d["stages"]]
+            L.append("")
+        L += [f"- {d['note']}", ""]
+    elif d:
+        L += [f"Bytes received during the run: unavailable — {d.get('reason')}", ""]
+    return L
+
+
 def markdown(s: dict) -> str:
     m, loc, p, perf = s["machine"], s["location"], s["pipeline"], s["performance"]
     b = loc["bbox"]
@@ -52,22 +98,45 @@ def markdown(s: dict) -> str:
          f"| Options | `{' '.join(p['pipeline_args']) or '(PSM defaults)'}` |",
          f"| Pipeline | {p['status']} (exit {p['exit_code']}), wall {_f(p['wall_time_s'], '{:.1f}')} s"
          f"{', degraded: ' + ', '.join(p['degraded']) if p['degraded'] else ''} |",
-         f"| Buildings left out of mesh | {p['flagged_buildings']} |", ""]
+         f"| Buildings left out of mesh | {p['flagged_buildings']} |",
+         *([f"| Alignment | **reused** from `{p['alignment_reused']}` (no photo download, segmentation "
+            f"or COLMAP this run: not comparable with a full run) |"] if p.get("alignment_reused") else []),
+         ""]
     if p.get("error_lines"):
         L += ["**Errors**", "", "```", *p["error_lines"], "```", ""]
     L += ["## Performance (PSM profiler)", ""]
     if not perf.get("available"):
         L += [f"Unavailable: {perf.get('reason')}", ""]
     else:
-        L += [f"Total {_f(perf['total_wall_time_s'], '{:.2f}')} s"
-              + (f" ({perf['min_per_km2']:.1f} min/km²)" if perf.get("min_per_km2") else "")
-              + f"; largest process RSS {_f(p.get('max_process_rss_mb'), '{:.0f}')} MB (OS).", "",
+        tm = perf.get("timing") or {}
+        if tm.get("available"):
+            d = tm["downloads_s"]
+            L += [f"**Processing time {_f(tm['processing_s'], '{:.1f}')} s**"
+                  + (f" ({perf['min_per_km2']:.1f} min/km²)" if perf.get("min_per_km2") else "")
+                  + " — downloads and scoring left out"
+                  + (" (except photo downloads overlapped with texturing, see Photos)"
+                     if tm.get("processing_includes_photo_downloads") else "") + ".", "",
+                  "| | s |", "|---|--:|",
+                  f"| processing | {_f(tm['processing_s'], '{:.1f}')} |",
+                  f"| downloads: OSM + Mapillary metadata (fetch) | {_f(d.get('fetch'), '{:.1f}')} |",
+                  f"| downloads: alignment photos | {_f(d.get('alignment_photos'), '{:.1f}')} |",
+                  f"| downloads: alignment OSM outlines | {_f(d.get('alignment_osm'), '{:.1f}')} |",
+                  f"| scoring (PSM's evaluate_* stages) | {_f(tm['scoring_s'], '{:.1f}')} |",
+                  f"| wall clock (everything) | {_f(tm['wall_clock_s'], '{:.1f}')} |", ""]
+        else:
+            L += [f"Wall clock {_f(perf['total_wall_time_s'], '{:.2f}')} s (downloads included; "
+                  "no processing/download split recorded)", ""]
+        ph = p.get("photos") or {}
+        if ph:
+            L += [f"**Photos:** {_photos(ph)}", ""]
+        L += [f"Largest process RSS {_f(p.get('max_process_rss_mb'), '{:.0f}')} MB (OS).", "",
               "| stage | status | wall s | cpu s | py heap peak MB | CUDA Δ MB |", "|---|---|--:|--:|--:|--:|"]
         for st in perf["stages"]:
             L.append(f"| {st['name']} | {st['status']} | {_f(st['wall_time_s'], '{:.2f}')} | "
                      f"{_f(st['cpu_time_s'], '{:.2f}')} | {_f(st['py_heap_peak_mb'], '{:.1f}')} | "
                      f"{_f(st['cuda_alloc_delta_mb'], '{:.1f}')} |")
-        L += ["", *[f"- {n}" for n in perf.get("notes", [])], ""]
+        L += ["", *[f"- {n}" for n in perf.get("notes", []) + (perf.get("timing") or {}).get("notes", [])], ""]
+    L += _network(s.get("network") or {})
     L += ["## Evaluations", "", "| metric | status | source | result |", "|---|---|---|---|"]
     for e in s["evaluations"]:
         if e["status"] == "OK":

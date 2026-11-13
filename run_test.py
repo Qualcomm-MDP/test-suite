@@ -2,6 +2,7 @@
 """Run the PSM pipeline on one area, then every available evaluation, into one results folder.
 
   python3 run_test.py --config config.toml                     # the standard command
+  python3 run_test.py --baseline                               # the standard benchmark (configs/baseline.toml)
   python3 run_test.py --config config.toml --dry-run           # checks only, runs nothing
   python3 run_test.py --config config.toml --bbox W S E N --name "Main St"
   python3 run_test.py --config config.toml --location "Ann Arbor, Michigan" --size-km 0.5
@@ -19,13 +20,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from psmtest import config, evals, hardware, location, pipeline, report
+from psmtest import config, evals, hardware, location, network, pipeline, report
 
 HERE = Path(__file__).resolve().parent
 # psm-test/1: first runs (absolute artifact paths; run 1 also lacks "suite").
 # psm-test/2: paths relative to the run folder, "files" index, pipeline.ml_devices,
 #             pipeline.model_downloads, machine.pipeline_python/torch_version/torch_cuda_build,
 #             geometry bias/nmad/within_*, stages[].cuda_start/cuda_end. Only additions otherwise.
+#             Later additions (still /2): network (before/after/during), pipeline.photos,
+#             pipeline.alignment_reused, performance.timing, suite.machine_config_file.
 SCHEMA = "psm-test/2"
 
 
@@ -55,7 +58,11 @@ def file_index(run_dir: Path) -> dict:
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--config", help="settings file (default: config.toml next to run_test.py, if present)")
+    which = ap.add_mutually_exclusive_group()
+    which.add_argument("--config", help="settings file (default: config.toml next to run_test.py, if present)")
+    which.add_argument("--baseline", action="store_true",
+                       help="use the standard benchmark settings, configs/baseline.toml (every PSM feature on); "
+                            "machine paths still come from your config.toml")
     where = ap.add_mutually_exclusive_group()
     where.add_argument("--location", help="place name, geocoded with OSM Nominatim (network)")
     where.add_argument("--bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
@@ -74,12 +81,17 @@ def parse_args(argv=None):
     ap.add_argument("--no-evals", action="store_true", help="skip evaluations")
     ap.add_argument("--no-texture-eval", action="store_true",
                     help="don't pass --evaluate-texture to PSM (no UV texture score)")
+    ap.add_argument("--no-network-test", action="store_true",
+                    help="skip the latency checks and speed test before and after the run "
+                         "(bytes received per stage are still recorded)")
     ap.add_argument("--glb", help="evaluate this existing .glb instead of running the pipeline")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and checks; run nothing")
     ap.add_argument("pipeline_args", nargs=argparse.REMAINDER, help="after --: extra src/main.py options")
     a = ap.parse_args(argv)
     a.pipeline_args = [x for x in a.pipeline_args if x != "--"]
-    if a.config is None and (HERE / "config.toml").exists():
+    if a.baseline:
+        a.config = str(config.BASELINE)
+    elif a.config is None and (HERE / "config.toml").exists():
         a.config = str(HERE / "config.toml")
     return a
 
@@ -87,6 +99,7 @@ def parse_args(argv=None):
 def settings(a) -> tuple[dict, Path]:
     """Config file + CLI overrides -> final settings (CLI wins)."""
     cfg, base = config.load(a.config)
+    a.machine_config = config.layer_machine(cfg, a.config)
     r, p, t = cfg["region"], cfg["pipeline"], cfg["test"]
     if a.bbox or a.location or a.center:  # a region on the command line replaces the config's
         r.update(bbox=a.bbox or [], location=a.location or "", center=a.center or [], size_km=0.0, name="")
@@ -102,6 +115,8 @@ def settings(a) -> tuple[dict, Path]:
     p["extra_args"] = list(p["extra_args"]) + a.pipeline_args
     if a.no_evals:
         t["run_evaluations"] = False
+    if a.no_network_test:
+        t["network_test"] = False
     if a.no_evals or a.no_texture_eval:
         p["evaluate_texture"] = False
     config.validate(cfg)
@@ -187,8 +202,10 @@ def main(argv=None) -> int:
               "mapillary_token": pipeline.has_token(repo) if not glb_given else "not needed",
               "evaluations": t["run_evaluations"],
               "texture_evaluation": "on" if texture_eval["requested"] else texture_eval["reason"],
-              "colmap": colmap["check"]}
-    print(json.dumps({"config": a.config, "location": loc, "psm": gitinfo, "checks": checks,
+              "colmap": colmap["check"],
+              "network_test": "on (latency + ~25 MB speed test, before and after)" if t["network_test"]
+              else "off (bytes received per stage still recorded)"}
+    print(json.dumps({"config": a.config, "machine_config": a.machine_config, "location": loc, "psm": gitinfo, "checks": checks,
                       "compute": machine["compute"], "expected_ml_device": machine["expected_ml_device"],
                       "pipeline_args": args, "results_dir": str(results_dir)}, indent=1))
     if colmap.get("warning"):
@@ -221,21 +238,35 @@ def main(argv=None) -> int:
         devices = {"expected": machine["expected_ml_device"], "observed": {}, "used": [],
                    "status": "not_run", "note": "--glb: pipeline not run"}
         downloads = {"status": "not_run", "note": "--glb: pipeline not run"}
+        photos = {"status": "not_run", "note": "--glb: pipeline not run"}
+        net = {"note": "--glb: pipeline not run"}
         status = "not_run"
     else:
         cmd = pipeline.command(py, repo, loc["bbox"], art, args)
+        net = {}
+        if t["network_test"]:
+            print("network check (latency to PSM's services, speed test) ...", flush=True)
+            net["before"] = network.probe()
         cache_before = pipeline.cache_snapshot(env)
-        res = pipeline.run(cmd, run_dir, env, logs / "pipeline.log")
+        with network.Sampler() as sampler:
+            res = pipeline.run(cmd, run_dir, env, logs / "pipeline.log")
         cache_after = pipeline.cache_snapshot(env)
+        if t["network_test"]:
+            net["after"] = network.probe()
         glb = art / "model.glb"
         perf = pipeline.parse_profile(art / "profile.json")
+        net["during"] = network.stage_traffic(sampler.samples, perf.get("started_at"), perf.get("stages", []))
         log_text = (logs / "pipeline.log").read_text(encoding="utf-8", errors="replace")
         scan = pipeline.scan_log(log_text)
         devices = pipeline.ml_devices(log_text, machine["expected_ml_device"])
         downloads = pipeline.model_downloads(log_text, cache_before, cache_after)
+        photos = pipeline.photo_sources(log_text, args)
         status = pipeline.classify(res["exit_code"], glb.exists(), perf, scan["degraded"])
-        if perf.get("total_wall_time_s") and loc["area_km2"]:
-            perf["min_per_km2"] = round(perf["total_wall_time_s"] / 60 / loc["area_km2"], 2)
+        if perf.get("available"):
+            perf["timing"] = pipeline.timing(perf, photos, log_text)
+            if perf["timing"].get("available") and loc["area_km2"]:
+                # per km² of processing: downloads and scoring left out, like the headline time
+                perf["min_per_km2"] = round(perf["timing"]["processing_s"] / 60 / loc["area_km2"], 2)
 
     ctx = {"repo": repo, "python": py, "run_dir": run_dir, "logs": logs, "glb": glb, "env": env,
            "bbox": loc["bbox"], "pipeline_args": args, "started": started, "laz": ev["laz"],
@@ -257,15 +288,17 @@ def main(argv=None) -> int:
     summary = {
         "schema": SCHEMA, "run_id": run_dir.name, "created_utc": now.isoformat(timespec="seconds"),
         "status": status, "machine": machine, "location": loc,
-        "suite": {**suite_git(), "config_file": a.config, "settings": cfg},
+        "suite": {**suite_git(), "config_file": a.config,
+                  "machine_config_file": a.machine_config, "settings": cfg},
         "pipeline": {"git": gitinfo, "psm_dir": str(repo), "python": py, "command": cmd,
                      "pipeline_args": args, "status": status, **res,
                      **{k: scan[k] for k in ("degraded", "flagged_buildings", "error_lines")},
-                     "ml_devices": devices, "model_downloads": downloads,
+                     "ml_devices": devices, "model_downloads": downloads, "photos": photos,
+                     "alignment_reused": photos.get("alignment_reused_from"),
                      "colmap": {k: v for k, v in colmap.items() if k != "check"},
                      "glb": rel(glb, run_dir) if glb.exists() else None,
                      "repo_changes": sorted(after - before) if before is not None and after is not None else None},
-        "performance": perf, "evaluations": results,
+        "performance": perf, "network": net, "evaluations": results,
         "files": file_index(run_dir),  # relative to this summary's folder
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")

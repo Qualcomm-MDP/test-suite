@@ -1,0 +1,33 @@
+# Standard PSM benchmark: the same area and every PSM feature on, identical on every machine.
+#   python3 run_test.py --baseline            (same as --config configs/baseline.toml)
+#
+# Don't edit this file for a one-off run: use command-line options, or copy it. Changing it
+# changes the benchmark, so results from before and after the change no longer compare.
+#
+# Machine settings are deliberately absent ([psm] dir/python/colmap, test.machine_label): they
+# come from your own git-ignored config.toml (see config.example.toml), then $PSM_REPO,
+# $PSM_PYTHON, $COLMAP_BIN, $PSM_MACHINE_LABEL, then auto-discovery.
+#
+# Needs: COLMAP 4.2+ (poses = "colmap"), network access for NAIP aerial photos (US only), and,
+# on first use, the model downloads (Mask2Former, LaMa, ALIKED/LightGlue, Inception-v3).
+# Relative paths below are relative to this file's folder (configs/).
+
+[region]
+name = "Ann Arbor"
+bbox = [-83.74998, 42.28025, -83.74695, 42.28250]   # west, south, east, north; 0.0624 km², downtown
+max_area_km2 = 2.0
+
+[pipeline]
+terrain = true              # --terrain: buildings and cameras on real ground heights
+segmentation = true         # Mask2Former finds obstructions (cars, people, poles) in the photos
+fill_obstructions = true    # LaMa inpaints them
+naip = true                 # --naip: NAIP aerial photos on the ground and roofs
+texture = "blend"           # PSM's default: every photo that sees a texel, weighted
+poses = "colmap"            # --poses colmap: COLMAP alignment of the photos to OSM walls
+aligned_only = false        # also texture from photos COLMAP could not align (their raw pose)
+evaluate_texture = true     # --evaluate-texture: PSM scores the UV texture (O, D, FID)
+extra_args = []
+
+[test]
+results_dir = "../results"  # the suite's results/ folder
+run_evaluations = true      # geometry vs. LiDAR, texture, pose alignment

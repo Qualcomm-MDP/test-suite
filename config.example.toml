@@ -2,6 +2,7 @@
 #   cp config.example.toml config.toml
 # Relative paths are relative to this file. Command-line options override everything here.
 # No credentials here: the Mapillary token goes in <PSM checkout>/.env (MAPILLARY_ACCESS_TOKEN=...).
+# With --baseline (configs/baseline.toml), only [psm] and test.machine_label are read from here.
 
 [psm]
 # PSM checkout (must contain src/main.py). Empty: $PSM_REPO, else ../PSM or ../qualcomm/PSM.
@@ -41,6 +42,7 @@ extra_args = []             # any other src/main.py arguments, e.g. ["--texture"
 results_dir = "results"
 machine_label = ""          # empty: $PSM_MACHINE_LABEL, else the hostname
 run_evaluations = true
+network_test = true         # latency to PSM's services + ~25 MB speed test, before and after the run
 
 [evaluation]
 # Where to read scripts/eval/eval_geometry_lidar.py if the checkout doesn't have it yet.

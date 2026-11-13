@@ -305,3 +305,88 @@ def classify(exit_code: int, glb_exists: bool, profile: dict, degraded: list[str
     if glb_exists or any(s["status"] == "ok" for s in profile.get("stages", [])):
         return "partial"
     return "failed"
+
+
+# ------------------------------------------------------------------ photos: downloaded or cached
+
+# Texturing's photo loop (texturing/tex_projection.py): a tqdm bar "Downloading images: n/N" over
+# every photo it uses, "Reused from the pose alignment: N photos, ..." for photos read from the
+# alignment's store instead of downloaded, and "Download failed [id]" per photo it could not get.
+# The alignment's own timing report (pose_alignment/run_pipeline.py) has "download N frames  T s"
+# and its fit report "align time: osm_buildings T s, ...".
+PHOTOS_TOTAL = re.compile(r"Downloading images:\s+\d+%\|[^|\n]*\|\s*\d+/(\d+)")
+PHOTOS_REUSED = re.compile(r"Reused from the pose alignment: (\d+) photos")
+PHOTO_FAILED = re.compile(r"Download failed \[")
+ALIGN_DOWNLOAD = re.compile(r"^\s*download (\d+) frames\s+([\d.]+) s\s*$", re.M)
+ALIGN_OSM = re.compile(r"align time: osm_buildings ([\d.]+) s")
+
+
+def photo_sources(text: str, pipeline_args: list[str]) -> dict:
+    """Where this run's street photos came from: downloaded during the run (by the alignment, or
+    by texturing while it processes), or cached on disk from an earlier run (an alignment folder
+    reused with --alignment-dir). PSM keeps no photo cache otherwise: raw-pose runs download every
+    photo every time."""
+    args = list(pipeline_args)
+    align_dir = args[args.index("--alignment-dir") + 1] if "--alignment-dir" in args[:-1] else None
+    poses = args[args.index("--poses") + 1] if "--poses" in args[:-1] else "raw"
+    m = PHOTOS_TOTAL.search(text)
+    out = {"poses": poses, "alignment_reused_from": align_dir}
+    if not m:
+        return {**out, "status": "unknown", "total": None,
+                "note": "texturing's photo count is not in the log (texturing did not run, or an "
+                        "older PSM log format)"}
+    total = int(m.group(1))
+    reused = sum(int(x) for x in PHOTOS_REUSED.findall(text))
+    failed = len(PHOTO_FAILED.findall(text))
+    dl = [(int(n), float(s)) for n, s in ALIGN_DOWNLOAD.findall(text) if int(n) > 0]
+    align_n, align_s = (sum(n for n, _ in dl), round(sum(s for _, s in dl), 2)) if dl else (0, None)
+    # photos texturing read from the alignment's store came from an earlier run when the alignment
+    # folder was reused and the alignment downloaded nothing this time; otherwise from this run's
+    cached = reused if align_dir and not align_n else 0
+    in_texturing = max(total - reused - failed, 0)
+    downloaded = (reused - cached) + in_texturing
+    status = ("none" if not total else "all_cached" if cached and not downloaded
+              else "partly_cached" if cached else "all_downloaded" if downloaded else "unknown")
+    notes = []
+    if cached:
+        notes.append(f"{cached} photos read from the reused alignment folder {align_dir} (downloaded "
+                     "by an earlier run)")
+    if reused - cached:
+        notes.append(f"{reused - cached} photos downloaded by this run's alignment"
+                     + (f" ({align_n} frames in {align_s} s, timed by PSM)" if align_s is not None else ""))
+    if in_texturing:
+        notes.append(f"{in_texturing} photos downloaded during texturing, in parallel with its "
+                     "processing: that download time is inside texturing_s and can't be separated")
+    if failed:
+        notes.append(f"{failed} photos could not be downloaded")
+    return {**out, "status": status, "total": total, "cached": cached,
+            "downloaded_by_alignment": reused - cached, "downloaded_in_texturing": in_texturing,
+            "failed": failed, "alignment_download_frames": align_n or None,
+            "alignment_download_s": align_s,
+            "download_overlaps_processing": in_texturing > 0, "note": "; ".join(notes)}
+
+
+def timing(perf: dict, photos: dict, text: str) -> dict:
+    """Split the run's time into processing (what the machine does to build the model), the
+    downloads PSM times on their own, and scoring. Processing never includes those downloads."""
+    stages = {s["name"]: s.get("wall_time_s") or 0.0 for s in perf.get("stages", [])}
+    total = perf.get("total_wall_time_s")
+    if total is None:
+        return {"available": False, "reason": "no profile"}
+    osm = ALIGN_OSM.findall(text)
+    downloads = {"fetch": round(stages.get("fetch", 0.0), 3),  # OSM buildings + Mapillary metadata
+                 "alignment_photos": photos.get("alignment_download_s") or 0.0,
+                 "alignment_osm": round(sum(float(x) for x in osm), 3) if osm else 0.0}
+    scoring = round(sum(stages.get(k, 0.0) for k in ("evaluate_geometry", "evaluate_texture")), 3)
+    processing = round(total - sum(downloads.values()) - scoring, 3)
+    notes = ["processing_s = profiler total - downloads_s - scoring_s",
+             "terrain and naip download their tiles inside those stages (a few seconds); they stay "
+             "in processing_s"]
+    if photos.get("download_overlaps_processing"):
+        notes.append("includes photo downloads done in parallel with texturing (see photos); PSM "
+                     "does not time them separately")
+    return {"available": True, "processing_s": processing, "downloads_s": downloads,
+            "download_total_s": round(sum(downloads.values()), 3), "scoring_s": scoring,
+            "wall_clock_s": total,
+            "processing_includes_photo_downloads": bool(photos.get("download_overlaps_processing")),
+            "notes": notes}
